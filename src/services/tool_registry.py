@@ -90,7 +90,6 @@ def create_tools(project_service) -> ToolRegistry:
                     "title": n.title,
                     "level": n.level.name,
                     "parent_id": n.parent_id,
-                    "children_ids": n.children_ids,
                     "status": n.status.value,
                 }
                 for n in project_service.get_outline_tree()
@@ -128,18 +127,27 @@ def create_tools(project_service) -> ToolRegistry:
 
     registry.register(ToolDef(
         name="read_setting",
-        description="读取指定设定文档的完整 Markdown 内容",
+        description="读取设定文档（支持单个或批量），传入分类名 + 文档名(或文档名列表)",
         parameters={
             "type": "object",
             "properties": {
                 "category": {"type": "string", "description": "设定分类名"},
-                "doc": {"type": "string", "description": "文档名（不含 .md）"},
+                "doc": {"type": "string", "description": "文档名（不含 .md），单个读取时使用"},
+                "docs": {"type": "array", "items": {"type": "string"},
+                         "description": "文档名列表，批量读取时使用（如 [\"斗气\", \"魔法\"]）"},
             },
-            "required": ["category", "doc"],
+            "required": ["category"],
         },
-        handler=lambda args: {
-            "content": project_service.get_setting(args["category"], args["doc"]) or "(文档不存在)",
-        },
+        handler=lambda args: (
+            # 优先批量
+            {doc: project_service.get_setting(args["category"], doc) or "(不存在)"
+             for doc in args["docs"]}
+            if "docs" in args
+            # 单文档向后兼容
+            else {"content": project_service.get_setting(args["category"], args.get("doc", "")) or "(文档不存在)"}
+            if "doc" in args
+            else {"error": "请提供 doc 或 docs 参数"}
+        ),
     ))
 
     registry.register(ToolDef(
@@ -163,19 +171,26 @@ def create_tools(project_service) -> ToolRegistry:
     # ── 大纲与章节工具 ──
 
     registry.register(ToolDef(
-        name="read_chapter",
-        description="读取指定大纲节点或章节的 Markdown 内容。请先通过 list_outline 了解节点结构",
+        name="read_nodes",
+        description="读取大纲节点/章节的 Markdown 内容（支持单个或批量）。先通过 list_outline 了解节点结构",
         parameters={
             "type": "object",
             "properties": {
-                "node_id": {"type": "string", "description": "大纲节点 ID"},
+                "node_id": {"type": "string", "description": "单个节点 ID"},
+                "node_ids": {"type": "array", "items": {"type": "string"},
+                             "description": "节点 ID 列表，批量读取时使用"},
             },
-            "required": ["node_id"],
+            "required": [],
         },
         handler=lambda args: (
-            {"content": project_service.get_node(args["node_id"]).content}
-            if project_service.get_node(args["node_id"])
-            else {"error": "节点不存在"}
+            {nid: project_service.get_node(nid).content if project_service.get_node(nid) else "(不存在)"
+             for nid in args["node_ids"]}
+            if "node_ids" in args
+            else {"content": project_service.get_node(args["node_id"]).content}
+            if "node_id" in args and project_service.get_node(args["node_id"])
+            else {"error": f"节点 {args.get('node_id')} 不存在"}
+            if "node_id" in args
+            else {"error": "请提供 node_id 或 node_ids 参数"}
         ),
     ))
 
@@ -214,43 +229,6 @@ def create_tools(project_service) -> ToolRegistry:
                 ) and {"created": node.node_id, "title": node.title}
             )()
         ),
-    ))
-
-    # ── 批量读取工具 ──
-
-    registry.register(ToolDef(
-        name="read_settings",
-        description="批量读取多个设定文档的内容。传入分类名和文档名列表，一次获取多份设定，用于需要同时了解多个相关设定的场景",
-        parameters={
-            "type": "object",
-            "properties": {
-                "category": {"type": "string", "description": "设定分类名"},
-                "docs": {"type": "array", "items": {"type": "string"},
-                         "description": "要读取的文档名列表，如 [\"斗气体系\", \"魔法体系\"]"},
-            },
-            "required": ["category", "docs"],
-        },
-        handler=lambda args: {
-            doc: project_service.get_setting(args["category"], doc) or "(不存在)"
-            for doc in args["docs"]
-        },
-    ))
-
-    registry.register(ToolDef(
-        name="read_outline_nodes",
-        description="批量读取多个大纲节点的内容。传入节点ID列表，一次获取多个节点的 Markdown 内容",
-        parameters={
-            "type": "object",
-            "properties": {
-                "node_ids": {"type": "array", "items": {"type": "string"},
-                             "description": "要读取的节点ID列表"},
-            },
-            "required": ["node_ids"],
-        },
-        handler=lambda args: {
-            nid: (project_service.get_node(nid).content if project_service.get_node(nid) else "(不存在)")
-            for nid in args["node_ids"]
-        },
     ))
 
     # ── 精准编辑工具（行/列级）──

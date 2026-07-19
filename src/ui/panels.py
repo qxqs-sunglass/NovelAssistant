@@ -79,79 +79,85 @@ class ChatPanel(BasePanel):
         self._config_manager = cm
 
     def _setup_ui(self):
-        # ── 第1行工具栏：对话操作 ──
-        toolbar = tk.Frame(self.frame, bg="#f0f0f0", height=38)
+        # ── 工具栏：紧凑布局 ──
+        toolbar = tk.Frame(self.frame, bg="#f0f0f0", height=32)
         toolbar.pack(fill="x")
         toolbar.pack_propagate(False)
-        tk.Button(toolbar, text="+ 新对话", command=self._new_session,
-                  font=("Microsoft YaHei", 10), padx=8).pack(side="left", padx=4, pady=4)
-        tk.Button(toolbar, text="🗑 删除", command=self._delete_session,
-                  font=("Microsoft YaHei", 10), padx=8).pack(side="left", pady=4)
-        self._session_var = tk.StringVar(value="新对话")
-        self._session_menu = ttk.OptionMenu(toolbar, self._session_var, "新对话",
-                                            command=self._on_session_selected)
-        self._session_menu.pack(side="left", padx=10)
-
-        # 项目选择器（对话页面也能切换项目）
-        tk.Label(toolbar, text="项目:", font=("Microsoft YaHei", 9),
-                 bg="#f0f0f0").pack(side="left", padx=(12, 2))
+        tk.Label(toolbar, text="项目:", font=("Microsoft YaHei", 9), bg="#f0f0f0",
+                 ).pack(side="left", padx=(6, 1), pady=4)
         self._chat_project_var = tk.StringVar(value="无项目")
         self._chat_project_menu = ttk.OptionMenu(toolbar, self._chat_project_var, "无项目",
                                                   command=self._on_chat_project)
-        self._chat_project_menu.pack(side="left", padx=2)
-
-        # 工具调用开关（on_show 时会按配置更新）
+        self._chat_project_menu.pack(side="left", padx=1)
+        tk.Label(toolbar, text="对话:", font=("Microsoft YaHei", 9), bg="#f0f0f0",
+                 ).pack(side="left", padx=(8, 1))
+        self._session_var = tk.StringVar(value="新对话")
+        self._session_menu = ttk.OptionMenu(toolbar, self._session_var, "新对话",
+                                            command=self._on_session_selected)
+        self._session_menu.pack(side="left", padx=1)
+        tk.Button(toolbar, text="+", command=self._new_session,
+                  font=("Microsoft YaHei", 9), padx=4, relief="flat",
+                  bg="#f0f0f0").pack(side="left", padx=1)
+        tk.Button(toolbar, text="🗑", command=self._delete_session,
+                  font=("Microsoft YaHei", 9), padx=4, relief="flat",
+                  bg="#f0f0f0").pack(side="left", padx=1)
+        # 工具开关
         self._tool_enabled = tk.BooleanVar(value=False)
-        tk.Checkbutton(toolbar, text="🔧AI工具", variable=self._tool_enabled,
-                       font=("Microsoft YaHei", 9), bg="#f0f0f0").pack(side="right", padx=6)
+        tk.Checkbutton(toolbar, text="🔧工具", variable=self._tool_enabled,
+                       font=("Microsoft YaHei", 9), bg="#f0f0f0",
+                       relief="flat").pack(side="right", padx=6)
 
-        # ── 第2a行：系统提示词（默认挂载，始终生效） ──
-        sys_prompt_bar = tk.Frame(self.frame, bg="#eef2f7", height=50)
-        sys_prompt_bar.pack(fill="x")
-        sys_prompt_bar.pack_propagate(False)
+        # ── 提示词折叠栏（默认收起，点展开编辑） ──
+        self._prompt_header = tk.Frame(self.frame, bg="#eef2f7", height=30)
+        self._prompt_header.pack(fill="x")
+        self._prompt_header.pack_propagate(False)
 
-        tk.Label(sys_prompt_bar, text="系统提示词:", font=("Microsoft YaHei", 9, "bold"),
+        tk.Button(self._prompt_header, text="📝 提示词", command=self._toggle_prompts,
+                  font=("Microsoft YaHei", 9, "bold"), bg="#eef2f7", relief="flat",
+                  padx=6).pack(side="left", padx=4)
+        self._prompt_summary_var = tk.StringVar(value="无")
+        tk.Label(self._prompt_header, textvariable=self._prompt_summary_var,
+                 font=("Microsoft YaHei", 9), bg="#eef2f7", fg="#666",
+                 anchor="w").pack(side="left", fill="x", expand=True, padx=4)
+        tk.Button(self._prompt_header, text="📎勾选", command=self._toggle_content_panel,
+                  font=("Microsoft YaHei", 9), padx=6).pack(side="right", padx=4)
+
+        # 提示词编辑面板（默认隐藏）
+        self._prompt_panel = tk.Frame(self.frame, bg="#f0f4fa", height=90)
+        self._prompts_visible = False
+
+        # 系统提示词行
+        sp_row = tk.Frame(self._prompt_panel, bg="#eef2f7")
+        sp_row.pack(fill="x", pady=1)
+        tk.Label(sp_row, text="系统提示词:", font=("Microsoft YaHei", 9, "bold"),
                  bg="#eef2f7").pack(side="left", padx=4)
         self._sys_prompt_var = tk.StringVar(value="无")
-        self._sys_prompt_menu = ttk.OptionMenu(sys_prompt_bar, self._sys_prompt_var, "无",
+        self._sys_prompt_menu = ttk.OptionMenu(sp_row, self._sys_prompt_var, "无",
                                                 command=self._on_sys_prompt_selected)
         self._sys_prompt_menu.pack(side="left", padx=2)
-
-        tk.Button(sys_prompt_bar, text="📎勾选内容", command=self._toggle_content_panel,
-                  font=("Microsoft YaHei", 9), padx=6).pack(side="left", padx=6)
-
-        tk.Button(sys_prompt_bar, text="💾保存", command=self._save_sys_prompt,
-                  font=("Microsoft YaHei", 8), padx=4).pack(side="left", padx=2)
-
-        self._sys_prompt_text = tk.Text(sys_prompt_bar, height=2, font=("Microsoft YaHei", 9),
+        tk.Button(sp_row, text="💾", command=self._save_sys_prompt,
+                  font=("Microsoft YaHei", 8), padx=3).pack(side="left", padx=2)
+        self._sys_prompt_text = tk.Text(sp_row, height=2, font=("Microsoft YaHei", 9),
                                          bg="#ffffff", borderwidth=1, relief="solid")
-        self._sys_prompt_text.pack(side="left", fill="x", expand=True, padx=4, pady=4)
+        self._sys_prompt_text.pack(side="left", fill="x", expand=True, padx=4, pady=2)
 
-        # ── 第2b行：附加提示词（弹性扩展，可选择启用） ──
-        add_prompt_bar = tk.Frame(self.frame, bg="#f5f0e8", height=44)
-        add_prompt_bar.pack(fill="x")
-        add_prompt_bar.pack_propagate(False)
-
-        tk.Label(add_prompt_bar, text="附加提示词:", font=("Microsoft YaHei", 9),
+        # 附加提示词行
+        ap_row = tk.Frame(self._prompt_panel, bg="#f5f0e8")
+        ap_row.pack(fill="x", pady=1)
+        tk.Label(ap_row, text="附加提示词:", font=("Microsoft YaHei", 9),
                  bg="#f5f0e8").pack(side="left", padx=4)
         self._add_prompt_enabled = tk.BooleanVar(value=False)
-        self._add_prompt_cb = tk.Checkbutton(add_prompt_bar, text="启用",
-                                              variable=self._add_prompt_enabled,
-                                              font=("Microsoft YaHei", 9),
-                                              bg="#f5f0e8")
-        self._add_prompt_cb.pack(side="left", padx=2)
-
+        tk.Checkbutton(ap_row, text="启用", variable=self._add_prompt_enabled,
+                        font=("Microsoft YaHei", 9), bg="#f5f0e8").pack(side="left", padx=2)
         self._add_prompt_var = tk.StringVar(value="无")
-        self._add_prompt_menu = ttk.OptionMenu(add_prompt_bar, self._add_prompt_var, "无",
+        self._add_prompt_menu = ttk.OptionMenu(ap_row, self._add_prompt_var, "无",
                                                 command=self._on_add_prompt_selected)
-        self._add_prompt_menu.pack(side="left", padx=(6, 2))
-
-        tk.Button(add_prompt_bar, text="💾保存", command=self._save_add_prompt,
-                  font=("Microsoft YaHei", 8), padx=4).pack(side="left", padx=2)
-
-        self._add_prompt_text = tk.Text(add_prompt_bar, height=2, font=("Microsoft YaHei", 9),
+        self._add_prompt_menu.pack(side="left", padx=2)
+        tk.Button(ap_row, text="💾", command=self._save_add_prompt,
+                  font=("Microsoft YaHei", 8), padx=3).pack(side="left", padx=2)
+        self._add_prompt_text = tk.Text(ap_row, height=2, font=("Microsoft YaHei", 9),
                                          bg="#ffffff", borderwidth=1, relief="solid")
-        self._add_prompt_text.pack(side="left", fill="x", expand=True, padx=4, pady=4)
+        self._add_prompt_text.pack(side="left", fill="x", expand=True, padx=4, pady=2)
 
         # ── 内容勾选面板（默认隐藏） ──
         self._content_panel = tk.Frame(self.frame, bg="#fafafa", height=160)
@@ -193,6 +199,12 @@ class ChatPanel(BasePanel):
         scrollbar = tk.Scrollbar(msg_frame, command=self._msg_text.yview)
         scrollbar.pack(side="right", fill="y")
         self._msg_text.config(yscrollcommand=scrollbar.set)
+
+        # 消息区右键菜单
+        self._msg_menu = tk.Menu(self.frame, tearoff=0)
+        self._msg_menu.add_command(label="📋 复制全文", command=self._copy_all_messages)
+        self._msg_menu.add_command(label="🔄 重试", command=self._retry_last)
+        self._msg_text.bind("<Button-3>", lambda e: self._msg_menu.post(e.x_root, e.y_root))
 
         # 占位提示（无消息时显示）
         self._msg_placeholder = tk.Label(
@@ -447,7 +459,7 @@ class ChatPanel(BasePanel):
             self._walk_update_display(child)
 
     def _gather_selected_content(self) -> str:
-        """收集所有勾选的内容，拼接为一段上下文"""
+        """收集所有勾选的内容，拼接为一段上下文（发送时实时读取）"""
         parts = []
         for key, var in self._content_checkboxes.items():
             if not var.get():
@@ -456,14 +468,30 @@ class ChatPanel(BasePanel):
                 node_id = key.replace("outline:", "")
                 node = self._project_service.get_node(node_id)
                 if node and node.content:
-                    parts.append(f"【{node.title}】\n{node.content}")
+                    parts.append(f"【{node.title}】\n{node.content[:3000]}{'...(截断)' if len(node.content) > 3000 else ''}")
             elif key.startswith("setting:"):
                 cat_doc = key.replace("setting:", "")
                 cat, doc = cat_doc.split("/", 1)
                 text = self._project_service.get_setting(cat, doc)
                 if text:
-                    parts.append(f"【设定: {cat}/{doc}】\n{text}")
+                    parts.append(f"【设定: {cat}/{doc}】\n{text[:3000]}{'...(截断)' if len(text) > 3000 else ''}")
         return "\n\n---\n\n".join(parts)
+
+    def _get_selected_display(self) -> str:
+        """获取勾选项的显示摘要（仅标题，不读内容）"""
+        names = []
+        for key, var in self._content_checkboxes.items():
+            if not var.get():
+                continue
+            if key.startswith("outline:"):
+                node_id = key.replace("outline:", "")
+                node = self._project_service.get_node(node_id)
+                if node:
+                    names.append(f"大纲·{node.title}")
+            elif key.startswith("setting:"):
+                cat_doc = key.replace("setting:", "")
+                names.append(f"设定·{cat_doc}")
+        return ", ".join(names)
 
     # ── 发送与对话 ──
 
@@ -493,6 +521,25 @@ class ChatPanel(BasePanel):
         summary = "【历史对话摘要】\n" + "\n".join(summary_parts)
         return [ChatMessage("system", summary)] + recent
 
+    def _toggle_prompts(self):
+        """展开/收起提示词编辑面板"""
+        if self._prompts_visible:
+            self._prompt_panel.pack_forget()
+            self._prompts_visible = False
+        else:
+            self._prompt_panel.pack(fill="x", after=self._prompt_header)
+            self._prompts_visible = True
+            # 刷新摘要
+            sp = self._sys_prompt_text.get("1.0", "end-1c").strip()
+            self._prompt_summary_var.set(sp[:50] + ("…" if len(sp) > 50 else "") if sp else "无")
+
+    def _stop_streaming(self):
+        """停止当前 AI 流式输出"""
+        self._ai_client.cancel() if hasattr(self._ai_client, "cancel") else None
+        self._is_streaming = False
+        self._send_btn.config(text="发送", bg="#0078d4", command=self._on_send)
+        self._append_message("system", "⏹ 已停止生成")
+
     def _on_send(self, event=None):
         text = self._input_text.get("1.0", "end-1c").strip()
         if not text or self._is_streaming:
@@ -504,21 +551,30 @@ class ChatPanel(BasePanel):
             self._current_session_id = s.session_id
             self._refresh_session_list()
 
-        # 拼接选中内容
+        # 勾选内容：仅存引用（显示摘要），发送时实时读取
+        refs_display = self._get_selected_display()
+        self._append_message("user", text)
+        user_meta = {"refs_display": refs_display} if refs_display else None
+        self._session_manager.add_message(
+            self._current_session_id, "user", text, meta=user_meta)
+
+        # 构建 AI 消息：实时读取勾选内容
         selected = self._gather_selected_content()
         full_text = text
         if selected:
             full_text = f"{text}\n\n---\n【以下为选中的已有内容供参考】\n{selected}"
 
-        self._append_message("user", text)
-        self._session_manager.add_message(self._current_session_id, "user", full_text)
-
-        messages = [
+        messages = [ChatMessage("user", full_text)]
+        # 添加历史（排除 tool 消息 + 旧历史裁剪）
+        history = [
+            m for m in self._session_manager.get_message_history(self._current_session_id, 50)
+            if m.get("role") not in ("tool",)
+        ][:-1]  # 排除当前 user 消息（已单独构建 full_text）
+        history_msgs = [
             ChatMessage(m["role"], m["content"])
-            for m in self._session_manager.get_message_history(self._current_session_id, 50)
+            for m in history
         ]
-        # 智能裁剪：保留最近N轮，旧历史压缩为摘要
-        messages = self._trim_history(messages)
+        messages = self._trim_history(history_msgs) + messages
 
         # 组合系统提示词 + 附加提示词（若启用）
         system_prompt = self._sys_prompt_text.get("1.0", "end-1c").strip()
@@ -529,8 +585,8 @@ class ChatPanel(BasePanel):
 
         self._response_buffer = ""
         self._is_streaming = True
-        self._ai_prefix_inserted = False   # 新一轮回复，重置 AI 前缀标记
-        self._send_btn.config(state="disabled")
+        self._ai_prefix_inserted = False
+        self._send_btn.config(text="⏹ 停止", bg="#d32f2f", command=self._stop_streaming)
 
         use_tools = self._tool_enabled.get() and self._tool_registry is not None
 
@@ -555,7 +611,8 @@ class ChatPanel(BasePanel):
                 self._event_bus.publish("ai:response_error", {"error": f"内部错误: {e}"}, "ChatPanel")
             finally:
                 self._is_streaming = False
-                self.frame.after(0, lambda: self._send_btn.config(state="normal"))
+                self.frame.after(0, lambda: self._send_btn.config(
+                    text="发送", bg="#0078d4", command=self._on_send))
 
         threading.Thread(target=stream_thread, daemon=True).start()
 
@@ -579,9 +636,17 @@ class ChatPanel(BasePanel):
             self._append_message("system", f"{action} {loc}: {text_preview}...")
         else:
             self._append_message("system", f"🔧 AI 调用工具: {tool}({json.dumps(args, ensure_ascii=False)[:80]})")
+        if self._current_session_id:
+            self._session_manager.add_message(self._current_session_id, "tool",
+                json.dumps({"action": "call", "tool": tool, "args": args}, ensure_ascii=False))
 
     def _on_tool_result(self, event):
         self._append_message("system", f"✅ 工具执行完成: {event.data.get('tool', '?')}")
+        if self._current_session_id:
+            result = event.data.get("result", "")
+            self._session_manager.add_message(self._current_session_id, "tool",
+                json.dumps({"action": "result", "tool": event.data.get("tool", ""),
+                            "result": str(result)[:500]}, ensure_ascii=False))
 
     def _on_response_end(self, event):
         if self._current_session_id:
@@ -590,6 +655,27 @@ class ChatPanel(BasePanel):
 
     def _on_response_error(self, event):
         self._append_message("system", f"❌ 错误: {event.data.get('error', '未知错误')}")
+
+    def _copy_all_messages(self):
+        """复制消息区全文到剪贴板"""
+        all_text = self._msg_text.get("1.0", "end-1c")
+        self.frame.clipboard_clear()
+        self.frame.clipboard_append(all_text)
+
+    def _retry_last(self):
+        """重试：取出最后一条用户消息重新发送"""
+        if self._is_streaming or not self._current_session_id:
+            return
+        history = self._session_manager.get_message_history(self._current_session_id, 100)
+        last_user = ""
+        for m in reversed(history):
+            if m.get("role") == "user":
+                last_user = m["content"]
+                break
+        if last_user:
+            self._input_text.delete("1.0", "end")
+            self._input_text.insert("1.0", last_user)
+            self._on_send()
 
     def _append_message(self, role: str, content: str):
         # 隐藏占位提示

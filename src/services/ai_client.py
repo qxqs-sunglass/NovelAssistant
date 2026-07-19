@@ -83,6 +83,11 @@ class AIClient:
 
         # OpenAI 客户端（延迟创建）
         self._client: Optional[OpenAI] = None
+        self._cancelled = False
+
+    def cancel(self):
+        """取消当前流式请求"""
+        self._cancelled = True
 
     # ==================== 连接管理 ====================
 
@@ -229,6 +234,7 @@ class AIClient:
         Raises:
             AIClientError
         """
+        self._cancelled = False
         client = self._get_or_create_client()
         model = self._model or self._model_minor
         if not model:
@@ -246,6 +252,9 @@ class AIClient:
 
             full_text = ""
             for chunk in stream:
+                if self._cancelled:
+                    stream.close()
+                    break
                 delta = chunk.choices[0].delta
                 if delta.content:
                     text = delta.content
@@ -288,7 +297,7 @@ class AIClient:
         每轮 AI 可能返回 tool_calls，执行后继续对话直到纯文本回复。
 
         Yields:
-            dict: {"type": "chunk", "content": str} | 
+            dict: {"type": "chunk", "content": str} |
                   {"type": "tool_call", "tool": str, "args": dict} |
                   {"type": "tool_result", "tool": str, "result": str} |
                   {"type": "done", "full_text": str}
@@ -302,6 +311,8 @@ class AIClient:
 
         full_text = ""
         for _round in range(max_rounds):
+            if self._cancelled:
+                break
             # 仅首轮发送 tool definitions，后续轮次 AI 已知工具集
             round_tools = tools if _round == 0 and tools else None
             try:
