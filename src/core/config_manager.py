@@ -50,7 +50,7 @@ class AISourceConfig:
     model_minor: str = ""                   # 备用模型
     temperature: float = 1.0
     top_p: float = 0.9
-    max_tokens: int = 2048
+    max_tokens: int = 10240
     extra_headers: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -80,7 +80,7 @@ class AISourceConfig:
 @dataclass
 class AppConfig:
     """应用全局配置"""
-    version: str = "0.2.0"
+    version: str = "1.0.0"
     language: str = "zh-CN"
     window_width: int = 1200
     window_height: int = 700
@@ -89,7 +89,7 @@ class AppConfig:
     current_ai_source: str = ""
     last_project: str = ""
     tool_enabled: bool = False
-    max_tool_rounds: int = 5          # AI 工具调用最大轮数
+    max_tool_rounds: int = 20          # AI 工具调用最大轮数
     ai_sources: list[AISourceConfig] = field(default_factory=list)
 
     @staticmethod
