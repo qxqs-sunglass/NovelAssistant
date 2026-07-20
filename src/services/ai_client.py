@@ -124,8 +124,13 @@ def parse_hallucinated_tool_calls(content: str, logger: Logger | None = None) ->
     if not content or not content.strip():
         return []
 
+    # ── 预处理：归一化 DSML 等"分隔式 XML"标签 ──
+    # 例：< | | DSML | | tool_calls> → <tool_calls>
+    #     < | | DSML | | invoke name="x"> → <invoke name="x">
+    #     </ | | DSML | | invoke> → </invoke>
+    handled_content = _normalize_pipe_tagged_xml(content)
+
     results: list[dict[str, Any]] = []
-    handled_content = content  # 用于在 xml_tool_calls_wrapper 等场景下二次处理
 
     for pattern_name, pattern in _HALLUCINATION_PATTERNS:
         if pattern_name == "xml_tool_calls_wrapper":
@@ -211,6 +216,79 @@ def _parse_inner_xml(inner: str) -> tuple[list[dict[str, Any]], str]:
         if name:
             results.append({"name": name, "arguments": args})
     return results, ""
+
+
+# ---------------------------------------------------------------------------
+# 标签归一化辅助函数（DSML 等"分隔式 XML"）
+# ---------------------------------------------------------------------------
+
+# 匹配任何"含 | 分隔符"的开始或结束标签
+# 典型输入：< | | DSML | | tool_calls>  /  </ | | DSML | | tool_calls>
+#           < | | function_call name="x">
+_PIPE_TAGGED = re.compile(
+    r"<[^<>]*\|[^<>]*>",
+    re.IGNORECASE,
+)
+
+
+def _normalize_pipe_tagged_xml(content: str) -> str:
+    """将"分隔式 XML"标签归一化为标准 XML 标签。
+
+    处理示例：
+    - `< | | DSML | | tool_calls>` → `<tool_calls>`
+    - `< | | DSML | | invoke name="x">` → `<invoke name="x">`
+    - `</ | | DSML | | invoke>` → `</invoke>`
+    - `< | | function_call name="x">` → `<function_call name="x">`
+    - `< | | parameter name="x">` → `<parameter name="x">`
+
+    通用规则：标签内由 `|` 拆出的"中间段"全部丢弃，只保留最后一段
+    （即真正的标签名 + 属性）。
+
+    这样能兼容任何形式的"分隔标签"，包括但不限于 DSML 协议。
+
+    Args:
+        content: 原始文本
+
+    Returns:
+        标签归一化后的文本
+    """
+    def _repl(m: re.Match[str]) -> str:
+        full = m.group(0)
+        stripped = full.strip()
+        # 是结束标签？兼容 < / | ... 这种带空格变体
+        is_close = stripped.startswith("</") or stripped.startswith("< /")
+        # 自闭和标签 <.../>
+        is_self_close = (
+            not is_close
+            and stripped.rstrip().endswith("/>")
+        )
+        # 去掉首尾
+        if is_close:
+            # 去掉 < 和 / 之后的所有前导
+            inner = re.sub(r"^<\s*/\s*", "", stripped)
+            inner = inner.rstrip().rstrip(">").strip()
+        else:
+            inner = re.sub(r"^<\s*/?\s*", "", stripped)
+            if inner.endswith("/>"):
+                inner = inner[:-2].rstrip()
+            else:
+                inner = inner.rstrip(">").strip()
+
+        # 按 | 切分
+        parts = [p.strip() for p in inner.split("|") if p.strip()]
+        if not parts:
+            return full  # 无法解析，原样返回
+        # 取最后一段作为真正的标签内容（可能含属性）
+        tag_body = parts[-1]
+        if is_close:
+            # 结束标签只保留标签名
+            tag_name = tag_body.split()[0] if tag_body.split() else ""
+            return f"</{tag_name}>"
+        if is_self_close:
+            return f"<{tag_body}/>"
+        return f"<{tag_body}>"
+
+    return _PIPE_TAGGED.sub(_repl, content)
 
 
 def _extract_args_from_xml_body(body: str) -> dict[str, Any]:
@@ -545,8 +623,12 @@ class AIClient:
 
         full_text = ""
         for _round in range(max_rounds):
-            # 仅首轮发送 tool definitions，后续轮次 AI 已知工具集
-            round_tools = tools if _round == 0 and tools else None
+            # 每轮都发送 tool definitions。
+            # DeepSeek V4 的 DSML tool-calling 是有状态的：
+            # 一旦触发工具调用，后续轮次若收不到 tools 定义，
+            # 模型不会自动退出 tool-calling 模式，反而会基于
+            # 上下文"脑补"不存在的工具名。
+            round_tools = tools if tools else None
             try:
                 response = client.chat.completions.create(
                     model=model,
