@@ -195,39 +195,50 @@ def create_tools(project_service) -> ToolRegistry:
     ))
 
     registry.register(ToolDef(
-        name="write_chapter",
-        description="创建新的大纲节点/章节，或通过 node_id 覆写已有节点的 Markdown 内容",
+        name="create_nodes",
+        description="创建/覆写大纲节点。支持批量创建：传入 nodes 数组一次创建多个；覆写时传 node_id",
         parameters={
             "type": "object",
             "properties": {
-                "node_id": {"type": "string", "description": "要覆写的已有节点ID（更新时传入；不传则创建新节点）"},
-                "parent_id": {"type": "string", "description": "父节点ID，创建新节点时使用（如创建顶级节点则不传）"},
-                "title": {"type": "string", "description": "节点标题（覆写时可选，不传则保留原标题）"},
+                "node_id": {"type": "string", "description": "覆写已有节点的ID（更新时用）"},
+                "parent_id": {"type": "string", "description": "父节点ID（创建时用；顶层不传）"},
+                "title": {"type": "string", "description": "节点标题"},
                 "content": {"type": "string", "description": "Markdown 内容"},
-                "level": {"type": "integer", "description": "层级: 1=大纲 2=卷 3=简纲 4=章纲 5=正文（仅创建新节点时使用）"},
+                "level": {"type": "integer", "description": "层级:1大纲 2卷 3简纲 4章纲 5正文"},
+                "nodes": {"type": "array", "items": {"type": "object", "properties": {
+                    "title": {"type": "string"}, "content": {"type": "string"},
+                    "level": {"type": "integer"},
+                }}, "description": "批量创建的子节点数组，每项含 title、content、可选 level"},
             },
-            "required": ["content"],
+            "required": [],
         },
         handler=lambda args: (
-            # 覆写已有节点
-            (
-                lambda nid: (
-                    {"updated": nid, "title": project_service.update_node(nid, title=args.get("title"), content=args["content"]).title}
-                    if project_service.get_node(nid)
-                    else {"error": f"节点 {nid} 不存在"}
-                )
-            )(args["node_id"])
+            # 批量创建
+            {"created": [
+                {"id": (n := project_service.create_node(
+                    args.get("parent_id"), item["title"],
+                    OutlineLevel(item.get("level", args.get("level", 5))),
+                    item["content"],
+                )).node_id, "title": n.title}
+                for item in args["nodes"]
+            ]}
+            if "nodes" in args
+            # 覆写已有
+            else {"updated": args["node_id"], "title": project_service.update_node(
+                args["node_id"], title=args.get("title"), content=args.get("content", "")
+            ).title}
+            if args.get("node_id") and project_service.get_node(args["node_id"])
+            else {"error": f"节点 {args.get('node_id')} 不存在"}
             if args.get("node_id")
-            # 创建新节点
-            else (
-                lambda: (
-                    node := project_service.create_node(
-                        args.get("parent_id"), args.get("title", "未命名"),
-                        OutlineLevel(args.get("level", 5)),
-                        args["content"],
-                    )
-                ) and {"created": node.node_id, "title": node.title}
-            )()
+            # 单个创建
+            else {"created": (
+                n := project_service.create_node(
+                    args.get("parent_id"), args.get("title", "未命名"),
+                    OutlineLevel(args.get("level", 5)), args.get("content", ""),
+                )
+            ).node_id, "title": n.title}
+            if args.get("content")
+            else {"error": "请提供 content、node_id 或 nodes 参数"}
         ),
     ))
 

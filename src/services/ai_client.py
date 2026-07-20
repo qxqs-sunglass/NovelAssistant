@@ -7,12 +7,17 @@ AI 客户端 — OpenAI 兼容 API 封装
   - 流式对话（逐 token 回调 + EventBus 发布）
   - 自动重试（网络错误 1 次）
   - 模型备用切换（主模型不可用时自动尝试备用模型）
+  - **方案A：幻觉工具调用自动检测与修复**（v0.3.1）
+
+当模型不支持原生 Function Calling 协议，而在 content 文本中
+以 XML/JSON 格式模拟工具调用时，自动解析并执行，确保对话不中断。
 
 用法:
     from src.core.ai_client import AIClient, ChatMessage
 
     client = AIClient(event_bus, logger)
     client.configure(base_url="...", api_key="sk-...", model="gpt-4o-mini")
+    client.set_hallucination_fix(True)  # 启用幻觉修复（默认开启）
     result = client.test_connection()
 
     for chunk in client.chat_stream([ChatMessage("user", "你好")]):
@@ -22,14 +27,245 @@ AI 客户端 — OpenAI 兼容 API 封装
 from __future__ import annotations
 
 import json
+import re
 import time
-from typing import Generator, Optional
+from typing import Any, Generator, Optional
 from dataclasses import dataclass
 from openai import OpenAI, APIError, APIConnectionError, AuthenticationError, \
     NotFoundError, RateLimitError, APITimeoutError
 
 from src.core.event_bus import EventBus
 from src.core.logger import Logger
+
+
+# ============================================================================
+# 幻觉工具调用检测（方案A）
+# ============================================================================
+
+# 支持的各种幻觉格式的正则模式（按精确度排序）
+_HALLUCINATION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    # 1. XML <invoke name="xxx"> 格式
+    (
+        "xml_invoke",
+        re.compile(
+            r'<invoke\s+name\s*=\s*["\']([^"\']+)["\']\s*>\s*'
+            r'(.*?)\s*'
+            r'</invoke>',
+            re.DOTALL | re.IGNORECASE,
+        ),
+    ),
+    # 2. XML <tool_calls><invoke>... 格式
+    (
+        "xml_tool_calls_wrapper",
+        re.compile(
+            r'<tool_calls?>\s*'
+            r'(.*?)'
+            r'</tool_calls?>',
+            re.DOTALL | re.IGNORECASE,
+        ),
+    ),
+    # 3. Markdown 代码块 JSON（单段）
+    (
+        "md_json_block",
+        re.compile(
+            r'```(?:json|tool_call)?\s*\n?'
+            r'(\{[^`]*?"(?:name|tool_name|function)"[^`]*?\})'
+            r'\s*\n?```',
+            re.DOTALL,
+        ),
+    ),
+    # 4. 裸 JSON：{"name":"xxx","arguments":{...}}
+    (
+        "bare_json",
+        re.compile(
+            r'\{\s*"(?:name|tool_name)"\s*:\s*"([^"]+)"\s*,'
+            r'\s*"(?:arguments|parameters|params)"\s*:\s*(\{[^}]+\})',
+            re.DOTALL,
+        ),
+    ),
+    # 5. XML function_call 格式
+    (
+        "xml_function_call",
+        re.compile(
+            r'<function_?calls?\s+name\s*=\s*["\']([^"\']+)["\']\s*>'
+            r'\s*(.*?)\s*'
+            r'</function_?calls?>',
+            re.DOTALL | re.IGNORECASE,
+        ),
+    ),
+    # 6. 双花括号 JSON（可能被 markdown 转义）: {{"name":"xxx","arguments":{...}}}
+    (
+        "double_brace_json",
+        re.compile(
+            r'\{\{\s*"(?:name|tool_name)"\s*:\s*"([^"]+)"\s*,'
+            r'\s*"(?:arguments|parameters|params)"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})\s*\}\}',
+            re.DOTALL,
+        ),
+    ),
+]
+
+
+def parse_hallucinated_tool_calls(content: str, logger: Logger | None = None) -> list[dict[str, Any]]:
+    """从 AI 回复文本中提取幻觉形式的工具调用。
+
+    按照预定义的正则模式依次尝试，一旦匹配成功即停止
+    （优先匹配更精确的 XML 格式，最后匹配裸 JSON）。
+
+    确保返回值中 arguments 始终为 dict 类型。
+
+    Args:
+        content: AI 的完整回复文本
+        logger: 可选的 Logger 实例用于调试输出
+
+    Returns:
+        提取到的工具调用列表，每个元素为 {"name": str, "arguments": dict}
+        若无匹配则返回空列表
+    """
+    if not content or not content.strip():
+        return []
+
+    results: list[dict[str, Any]] = []
+    handled_content = content  # 用于在 xml_tool_calls_wrapper 等场景下二次处理
+
+    for pattern_name, pattern in _HALLUCINATION_PATTERNS:
+        if pattern_name == "xml_tool_calls_wrapper":
+            # 第一遍：看是否有外层包装
+            outer_match = pattern.search(handled_content)
+            if not outer_match:
+                continue
+            # 有外层包装，对内层递归使用子模式匹配
+            inner = outer_match.group(1).strip()
+            # 对内层文本尝试其他模式
+            sub_results, handled = _parse_inner_xml(inner)
+            if sub_results:
+                results = sub_results
+                if logger:
+                    logger.log(
+                        f"幻觉检测命中模式: {pattern_name} (内层 {len(results)} 个调用)",
+                        "AIClient", "INFO",
+                    )
+                break
+            continue
+
+        matches = pattern.findall(handled_content)
+        if not matches:
+            continue
+
+        if logger:
+            logger.log(f"幻觉检测命中模式: {pattern_name}", "AIClient", "INFO")
+
+        for match in matches:
+            try:
+                tool_name = ""
+                arguments: dict[str, Any] = {}
+
+                if pattern_name == "xml_invoke":
+                    tool_name = match[0]
+                    arguments = _extract_args_from_xml_body(match[1])
+
+                elif pattern_name == "md_json_block":
+                    obj = json.loads(match if isinstance(match, str) else str(match))
+                    tool_name = obj.get("name") or obj.get("tool_name") or ""
+                    arguments = _normalize_args(obj.get("arguments") or obj.get("parameters") or obj.get("params") or {})
+
+                elif pattern_name in ("bare_json", "double_brace_json"):
+                    tool_name = match[0]
+                    try:
+                        arguments = json.loads(match[1])
+                    except json.JSONDecodeError:
+                        arguments = {}
+
+                elif pattern_name == "xml_function_call":
+                    tool_name = match[0]
+                    arguments = _extract_args_from_xml_body(match[1])
+
+                if tool_name:
+                    # 防御：确保 arguments 是 dict
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    results.append({"name": tool_name, "arguments": arguments})
+
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+                if logger:
+                    logger.log(
+                        f"解析幻觉工具调用失败 (pattern={pattern_name}): {e}",
+                        "AIClient", "WARNING",
+                    )
+                continue
+
+        if results:
+            break
+
+    return results
+
+
+def _parse_inner_xml(inner: str) -> tuple[list[dict[str, Any]], str]:
+    """解析 <tool_calls> 或外层 XML 包裹的内部内容。"""
+    results: list[dict[str, Any]] = []
+    invokes = re.findall(
+        r'<invoke\s+name\s*=\s*["\']([^"\']+)["\']\s*>\s*(.*?)\s*</invoke>',
+        inner, re.DOTALL | re.IGNORECASE,
+    )
+    for name, body in invokes:
+        args = _extract_args_from_xml_body(body)
+        if name:
+            results.append({"name": name, "arguments": args})
+    return results, ""
+
+
+def _extract_args_from_xml_body(body: str) -> dict[str, Any]:
+    """从 XML invoke 体内提取参数。
+
+    支持：
+    1. <parameter name="x">value</parameter> 格式
+    2. 直接 JSON
+    3. JSON 片段（匹配花括号）
+    """
+    body = body.strip()
+    if not body:
+        return {}
+
+    # 1. 尝试直接 JSON
+    try:
+        obj = json.loads(body)
+        if isinstance(obj, dict):
+            return _normalize_args(obj)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. 提取 <parameter name="x">...</parameter>
+    params: dict[str, Any] = {}
+    param_matches = re.findall(
+        r'<parameter\s+name\s*=\s*["\']([^"\']+)["\']\s*>(.*?)</parameter\s*>',
+        body, re.DOTALL | re.IGNORECASE,
+    )
+    if param_matches:
+        for pname, pval in param_matches:
+            params[pname] = pval.strip()
+        return params
+
+    # 3. 提取嵌套 JSON（尝试匹配最外层花括号）
+    brace_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', body)
+    if brace_match:
+        try:
+            return _normalize_args(json.loads(brace_match.group(0)))
+        except json.JSONDecodeError:
+            pass
+
+    return {}
+
+
+def _normalize_args(raw: Any) -> dict[str, Any]:
+    """将参数规范化为 dict。处理字符串包裹的 JSON。"""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
 
 
 # ==================== 数据类 ====================
@@ -81,13 +317,11 @@ class AIClient:
         self._max_tokens: int = 2048
         self._extra_headers: dict = {}
 
+        # 方案A：幻觉工具调用自动修复
+        self._fix_hallucinations: bool = True
+
         # OpenAI 客户端（延迟创建）
         self._client: Optional[OpenAI] = None
-        self._cancelled = False
-
-    def cancel(self):
-        """取消当前流式请求"""
-        self._cancelled = True
 
     # ==================== 连接管理 ====================
 
@@ -234,7 +468,6 @@ class AIClient:
         Raises:
             AIClientError
         """
-        self._cancelled = False
         client = self._get_or_create_client()
         model = self._model or self._model_minor
         if not model:
@@ -252,9 +485,6 @@ class AIClient:
 
             full_text = ""
             for chunk in stream:
-                if self._cancelled:
-                    stream.close()
-                    break
                 delta = chunk.choices[0].delta
                 if delta.content:
                     text = delta.content
@@ -292,15 +522,19 @@ class AIClient:
         system_prompt: str = "",
         max_rounds: int = 5,
     ) -> Generator[dict, None, None]:
-        """带工具调用的流式对话生成器
+        """带工具调用的流式对话生成器（含幻觉自动修复）
 
         每轮 AI 可能返回 tool_calls，执行后继续对话直到纯文本回复。
+        当模型不支持原生 Function Calling 而在文本中模拟工具调用时，
+        自动检测 XML/JSON 格式的工具调用并执行（方案A，默认开启）。
 
         Yields:
             dict: {"type": "chunk", "content": str} |
-                  {"type": "tool_call", "tool": str, "args": dict} |
-                  {"type": "tool_result", "tool": str, "result": str} |
-                  {"type": "done", "full_text": str}
+                  {"type": "tool_call", "tool": str, "args": dict, "hallucinated"?: bool} |
+                  {"type": "tool_result", "tool": str, "result": str, "hallucinated"?: bool} |
+                  {"type": "hallucination_detected", "patterns_found": int} |
+                  {"type": "done", "full_text": str} |
+                  {"type": "error", "error": str}
         """
         client = self._get_or_create_client()
         full_messages = self._build_messages(messages, system_prompt)
@@ -311,8 +545,6 @@ class AIClient:
 
         full_text = ""
         for _round in range(max_rounds):
-            if self._cancelled:
-                break
             # 仅首轮发送 tool definitions，后续轮次 AI 已知工具集
             round_tools = tools if _round == 0 and tools else None
             try:
@@ -353,7 +585,7 @@ class AIClient:
                             if tc.function.arguments:
                                 tool_calls_data[tc.index]["function"]["arguments"] += tc.function.arguments
 
-                # 如果有工具调用
+                # 如果有工具调用（原生 API）
                 if tool_calls_data:
                     # 追加 assistant 消息
                     full_messages.append({
@@ -408,6 +640,98 @@ class AIClient:
 
                     continue  # 继续下一轮对话
 
+                # ── 方案A：幻觉工具调用检测 ──
+                if (
+                    self._fix_hallucinations
+                    and round_text.strip()
+                ):
+                    hallucinated = parse_hallucinated_tool_calls(
+                        round_text, self._logger
+                    )
+                    if hallucinated:
+                        self._logger.log(
+                            f"检测到幻觉工具调用 {len(hallucinated)} 个，自动修复中...",
+                            "AIClient", "WARNING",
+                        )
+
+                        yield {
+                            "type": "hallucination_detected",
+                            "patterns_found": len(hallucinated),
+                        }
+
+                        # 将 assistant 原始消息追加到历史
+                        full_messages.append({
+                            "role": "assistant",
+                            "content": round_text,
+                        })
+
+                        # 逐个执行
+                        for hc in hallucinated:
+                            tool_name = hc["name"]
+                            arguments = hc["arguments"]
+
+                            self._event_bus.publish(
+                                "ai:tool_call",
+                                {"tool": tool_name, "args": arguments, "hallucinated": True},
+                                "AIClient",
+                            )
+                            yield {
+                                "type": "tool_call",
+                                "tool": tool_name,
+                                "args": arguments,
+                                "hallucinated": True,
+                            }
+
+                            try:
+                                result = tool_registry.execute(tool_name, arguments)
+                            except Exception as e:
+                                result = json.dumps(
+                                    {"error": f"工具执行失败: {e}"},
+                                    ensure_ascii=False,
+                                )
+                                self._logger.log(
+                                    f"幻觉工具执行失败: {tool_name}: {e}",
+                                    "AIClient", "ERROR",
+                                )
+
+                            # 截断
+                            MAX_TOOL_RESULT = 3000
+                            truncated = str(result)
+                            if len(truncated) > MAX_TOOL_RESULT:
+                                truncated = truncated[:MAX_TOOL_RESULT] + "\n...(内容已截断)"
+
+                            self._event_bus.publish(
+                                "ai:tool_result",
+                                {"tool": tool_name, "result": truncated, "hallucinated": True},
+                                "AIClient",
+                            )
+                            yield {
+                                "type": "tool_result",
+                                "tool": tool_name,
+                                "result": truncated,
+                                "hallucinated": True,
+                            }
+
+                            # 追加工具结果到消息历史（用 hall_ 前缀区分）
+                            full_messages.append({
+                                "role": "tool",
+                                "tool_call_id": f"hall_{tool_name}",
+                                "content": truncated,
+                            })
+
+                        # 追加引导提示，让模型基于结果继续
+                        full_messages.append({
+                            "role": "system",
+                            "content": (
+                                "你刚才的工具调用请求已通过自动修复机制执行完毕，"
+                                "执行结果已附在对应的 tool 消息中。请基于这些结果继续你的回复，"
+                                "无需再次发起相同的工具调用。如果需要，请通过 API 的 "
+                                "tool_calls 协议发起新的工具调用。"
+                            ),
+                        })
+
+                        continue  # 继续下一轮
+
                 # 纯文本回复，完成
                 self._event_bus.publish(
                     "ai:response_end",
@@ -432,6 +756,22 @@ class AIClient:
         yield {"type": "error", "error": f"工具调用超过最大轮数 ({max_rounds})"}
 
     # ==================== 状态查询 ====================
+
+    def set_hallucination_fix(self, enabled: bool) -> None:
+        """启用/禁用幻觉工具调用自动修复（方案A）。
+
+        当模型不支持原生 Function Calling 而将工具调用写为
+        XML/JSON 文本时，自动解析并执行。
+
+        Args:
+            enabled: True 启用自动修复（默认）
+        """
+        self._fix_hallucinations = enabled
+
+    @property
+    def hallucination_fix_enabled(self) -> bool:
+        """幻觉修复是否启用。"""
+        return self._fix_hallucinations
 
     @property
     def is_configured(self) -> bool:
