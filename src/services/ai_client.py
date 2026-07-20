@@ -615,7 +615,14 @@ class AIClient:
                   {"type": "error", "error": str}
         """
         client = self._get_or_create_client()
-        full_messages = self._build_messages(messages, system_prompt)
+        # 过滤历史消息中的 tool/function 角色，防止跨轮次/跨会话的
+        # 旧工具调用信息污染新的 AI 请求。
+        # 当前轮次产生的 tool 交互通过 full_messages 内部管理，不受影响。
+        clean_messages = [
+            m for m in messages
+            if m.role in ("user", "assistant", "system")
+        ]
+        full_messages = self._build_messages(clean_messages, system_prompt)
         tools = tool_registry.get_tool_schemas()
         model = self._model or self._model_minor
         if not model:
@@ -703,21 +710,10 @@ class AIClient:
                         )
                         yield {"type": "tool_result", "tool": tool_name, "result": result}
 
-                        # 工具结果截断（≤3000字符）+ 去重旧结果
-                        MAX_TOOL_RESULT = 3000
-                        truncated = str(result)
-                        if len(truncated) > MAX_TOOL_RESULT:
-                            truncated = truncated[:MAX_TOOL_RESULT] + "\n...(内容已截断)"
-
-                        # 移除之前同工具的历史结果，避免累积膨胀
-                        full_messages = [
-                            m for m in full_messages
-                            if m.get("role") != "tool" or m.get("tool_call_id") != tc["id"]
-                        ]
                         full_messages.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],
-                            "content": truncated,
+                            "content": str(result),
                         })
 
                     continue  # 继续下一轮对话
@@ -776,21 +772,15 @@ class AIClient:
                                     "AIClient", "ERROR",
                                 )
 
-                            # 截断
-                            MAX_TOOL_RESULT = 3000
-                            truncated = str(result)
-                            if len(truncated) > MAX_TOOL_RESULT:
-                                truncated = truncated[:MAX_TOOL_RESULT] + "\n...(内容已截断)"
-
                             self._event_bus.publish(
                                 "ai:tool_result",
-                                {"tool": tool_name, "result": truncated, "hallucinated": True},
+                                {"tool": tool_name, "result": str(result), "hallucinated": True},
                                 "AIClient",
                             )
                             yield {
                                 "type": "tool_result",
                                 "tool": tool_name,
-                                "result": truncated,
+                                "result": str(result),
                                 "hallucinated": True,
                             }
 
@@ -798,7 +788,7 @@ class AIClient:
                             full_messages.append({
                                 "role": "tool",
                                 "tool_call_id": f"hall_{tool_name}",
-                                "content": truncated,
+                                "content": str(result),
                             })
 
                         # 追加引导提示，让模型基于结果继续

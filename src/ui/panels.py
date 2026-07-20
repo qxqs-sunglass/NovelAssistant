@@ -468,13 +468,13 @@ class ChatPanel(BasePanel):
                 node_id = key.replace("outline:", "")
                 node = self._project_service.get_node(node_id)
                 if node and node.content:
-                    parts.append(f"【{node.title}】\n{node.content[:3000]}{'...(截断)' if len(node.content) > 3000 else ''}")
+                    parts.append(f"【{node.title}】\n{node.content}")
             elif key.startswith("setting:"):
                 cat_doc = key.replace("setting:", "")
                 cat, doc = cat_doc.split("/", 1)
                 text = self._project_service.get_setting(cat, doc)
                 if text:
-                    parts.append(f"【设定: {cat}/{doc}】\n{text[:3000]}{'...(截断)' if len(text) > 3000 else ''}")
+                    parts.append(f"【设定: {cat}/{doc}】\n{text}")
         return "\n\n---\n\n".join(parts)
 
     def _get_selected_display(self) -> str:
