@@ -1045,6 +1045,9 @@ class OutlinePanel(BasePanel):
         self._project_var.set(current or "无项目")
 
     def _switch_project(self, name: str):
+        # 如果正在切换同一个项目，跳过以避免递归刷新
+        if name == self._project_service.get_current_project():
+            return
         self._auto_save_if_dirty()
         self._project_service.switch_project(name)
         self._project_var.set(name)
@@ -3097,7 +3100,10 @@ class LogPanel(BasePanel):
     # ★ v2.0: 切换到日志面板时加载历史日志
     def on_show(self):
         if not self._log_loaded:
-            self._load_history_logs()
+            try:
+                self._load_history_logs()
+            except Exception:
+                pass  # 加载失败不影响面板切换
             self._log_loaded = True
 
     def _load_history_logs(self):
@@ -3132,10 +3138,9 @@ class LogPanel(BasePanel):
                 except Exception:
                     pass
             if count > 0:
-                self.logger.log(f"加载历史日志 {count} 条", "LogPanel", "INFO")
                 self._apply_filter()
-        except Exception as e:
-            self.logger.log(f"加载历史日志失败: {e}", "LogPanel", "WARNING")
+        except Exception:
+            pass  # 静默失败，不影响面板使用
 
     def _on_new_log(self, event):
         """收到新日志"""
