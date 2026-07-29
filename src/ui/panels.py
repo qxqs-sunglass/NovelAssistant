@@ -2433,9 +2433,10 @@ class CharacterPanel(BasePanel):
         self._event_bus.subscribe("character:created", lambda e: self._refresh_character_list())
         self._event_bus.subscribe("character:updated", lambda e: self._refresh_character_list())
         self._event_bus.subscribe("character:deleted", lambda e: self._on_character_deleted(e))
-        self._event_bus.subscribe("camp:created", lambda e: self._refresh_camp_tags())
-        self._event_bus.subscribe("camp:updated", lambda e: self._refresh_camp_tags())
-        self._event_bus.subscribe("camp:deleted", lambda e: self._refresh_camp_tags())
+        # ★ 阵营变更同时刷新标签和角色列表（角色列表显示阵营名称）
+        self._event_bus.subscribe("camp:created", lambda e: (self._refresh_camp_tags(), self._refresh_character_list()))
+        self._event_bus.subscribe("camp:updated", lambda e: (self._refresh_camp_tags(), self._refresh_character_list()))
+        self._event_bus.subscribe("camp:deleted", lambda e: (self._refresh_camp_tags(), self._refresh_character_list()))
 
     def on_show(self):
         self._refresh_character_list()
