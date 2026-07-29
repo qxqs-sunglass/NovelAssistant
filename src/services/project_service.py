@@ -921,14 +921,32 @@ class ProjectService:
     def get_node(self, node_id: str) -> Optional[OutlineNode]:
         for n in self.get_outline_tree():
             if n.node_id == node_id:
-                # 加载内容
                 data = self._load_outline()
                 nodes = data.get("nodes", {})
                 if isinstance(nodes, list):
                     nodes = {nd.get("node_id", ""): nd for nd in nodes}
                 nd = nodes.get(node_id, {})
-                if isinstance(nd, dict) and nd.get("file"):
-                    n.content = self._read_file(nd["file"])
+                content = ""
+                if isinstance(nd, dict):
+                    # ★ v1 兼容: content 可能直接嵌在 outline.json 中
+                    if nd.get("content"):
+                        content = nd["content"]
+                    # ★ v2: 从独立 .md 文件加载（优先，因为更完整）
+                    if nd.get("file"):
+                        file_content = self._read_file(nd["file"])
+                        # 容错：原路径找不到时按 node_id+level 推断
+                        if not file_content and isinstance(nd.get("level"), int):
+                            prefix = {1: "outline_L1", 2: "volume", 3: "brief",
+                                      4: "chapter", 5: "content"}.get(nd["level"], "node")
+                            alt = f"outline/{prefix}_{node_id[:8]}.md"
+                            if alt != nd["file"]:
+                                file_content = self._read_file(alt)
+                            # L5 v1 格式回退
+                            if not file_content and nd["level"] == 5:
+                                file_content = self._read_file(f"content/ch_{node_id[:8]}.md")
+                        if file_content:
+                            content = file_content
+                n.content = content
                 return n
         return None
 

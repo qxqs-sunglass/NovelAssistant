@@ -212,6 +212,7 @@ class MainWindow:
             self._project_service,
         )
         self._panels["status"].set_ai_client(self._ai_client)
+        self._panels["status"].set_config_manager(self._config_manager)
 
     def _subscribe_events(self) -> None:
         """订阅全局事件"""

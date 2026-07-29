@@ -2952,11 +2952,16 @@ class StatusPanel(BasePanel):
     def __init__(self, parent, event_bus, logger, project_service: ProjectService):
         self._project_service = project_service
         self._ai_client: "AIClient | None" = None
+        self._config_manager: "ConfigManager | None" = None
         self._status_content = tk.StringVar(value="（暂无数据，请选择项目后使用 AI 生成）")
         super().__init__(parent, event_bus, logger)
 
     def set_ai_client(self, ai_client: "AIClient"):
         self._ai_client = ai_client
+
+    def set_config_manager(self, config_manager: "ConfigManager"):
+        """注入配置管理器（用于自动加载 AI 配置）"""
+        self._config_manager = config_manager
 
     def _setup_ui(self):
         """状态展示 + AI 生成按钮"""
@@ -3029,8 +3034,23 @@ class StatusPanel(BasePanel):
             messagebox.showwarning("未配置 AI", "请先在配置面板中配置并测试 AI 连接。")
             return
 
+        # ★ 自动从 ConfigManager 加载已保存的 AI 源配置
+        if not self._ai_client.is_configured and self._config_manager:
+            source = self._config_manager.get_current_ai_source()
+            if source:
+                api_key = self._config_manager.get_api_key(source.name) or ""
+                self._ai_client.configure(
+                    base_url=source.base_url,
+                    api_key=api_key,
+                    model=source.model,
+                    model_minor=source.model_minor,
+                    temperature=source.temperature,
+                    top_p=source.top_p,
+                    max_tokens=source.max_tokens,
+                )
+
         if not self._ai_client.is_configured:
-            messagebox.showwarning("AI 未配置", "请先在配置面板中配置 AI 源。")
+            messagebox.showwarning("AI 未配置", "请先在配置面板中配置 AI 源，并点击「✅ 设为当前」激活。")
             return
 
         # Token 消耗确认
