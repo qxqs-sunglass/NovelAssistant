@@ -1,12 +1,14 @@
 """
-功能面板 — ChatPanel / OutlinePanel / SettingsPanel / ConfigPanel / LogPanel
+功能面板 — ChatPanel / OutlinePanel / CharacterPanel / ForeshadowPanel / SettingsPanel / StatusPanel / ConfigPanel / LogPanel
 
 每个面板封装自己的 UI 逻辑，通过 BasePanel 基类统一生命周期。
+★ v2.0: 新增 CharacterPanel / ForeshadowPanel / StatusPanel，修复 LogPanel
 """
 
 from __future__ import annotations
 
 import json
+import os
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from abc import ABC, abstractmethod
@@ -521,6 +523,39 @@ class ChatPanel(BasePanel):
         summary = "【历史对话摘要】\n" + "\n".join(summary_parts)
         return [ChatMessage("system", summary)] + recent
 
+    # ★ v2.0: 状态和伏笔上下文采集
+    def _get_status_context(self) -> str:
+        """从 StatusPanel 获取当前创作状态"""
+        try:
+            if hasattr(self, '_project_service') and self._project_service:
+                # 基本状态（不依赖 StatusPanel 实例）
+                ps = self._project_service
+                if ps.get_current_project():
+                    tree = ps.get_outline_tree()
+                    total = len(tree)
+                    completed = sum(1 for n in tree if n.status.value == "completed")
+                    l5_count = len([n for n in tree if n.level.value == 5])
+                    total_words = sum(n.word_count for n in tree if n.level.value == 5)
+                    return (
+                        f"【当前创作状态】\n"
+                        f"项目: {ps.get_current_project()}\n"
+                        f"大纲节点: {total} (已完成 {completed})\n"
+                        f"正文章节: {l5_count}\n"
+                        f"总字数: {total_words:,}"
+                    )
+        except Exception:
+            pass
+        return ""
+
+    def _get_foreshadow_context(self) -> str:
+        """从 ForeshadowService 获取未隐藏的伏笔"""
+        try:
+            if hasattr(self, '_project_service') and self._project_service:
+                return self._project_service.foreshadow_service.get_ai_context()
+        except Exception:
+            pass
+        return ""
+
     def _toggle_prompts(self):
         """展开/收起提示词编辑面板"""
         if self._prompts_visible:
@@ -558,11 +593,22 @@ class ChatPanel(BasePanel):
         self._session_manager.add_message(
             self._current_session_id, "user", text, meta=user_meta)
 
-        # 构建 AI 消息：实时读取勾选内容
+        # ★ v2.0: 按新顺序拼接上下文
+        # 1. 获取状态信息 (StatusPanel)
+        status_context = self._get_status_context()
+        # 2. 获取伏笔信息 (ForeshadowService, 仅 unhidden)
+        foreshadow_context = self._get_foreshadow_context()
+        # 3. 获取勾选内容（原有逻辑）
         selected = self._gather_selected_content()
+
+        # 组装: 消息 → 状态 → 伏笔 → 勾选内容
         full_text = text
+        if status_context:
+            full_text += f"\n\n---\n{status_context}"
+        if foreshadow_context:
+            full_text += f"\n\n---\n{foreshadow_context}"
         if selected:
-            full_text = f"{text}\n\n---\n【以下为选中的已有内容供参考】\n{selected}"
+            full_text += f"\n\n---\n【以下为选中的已有内容供参考】\n{selected}"
 
         messages = [ChatMessage("user", full_text)]
         # 添加历史（排除 tool 消息 + 旧历史裁剪）
@@ -2283,14 +2329,730 @@ class ConfigPanel(BasePanel):
         self._max_tokens_label.config(text=f"Max Tokens: {val}")
 
 
-# ==================== LogPanel ====================
+# ==================== CharacterPanel ★ v2.0 ====================
+
+class CharacterPanel(BasePanel):
+    """角色管理面板 — 以角色为唯一个体，固定字段 + MD 简介 + 多阵营标签"""
+
+    def __init__(self, parent, event_bus, logger, project_service: ProjectService):
+        self._project_service = project_service
+        self._current_char_id: str | None = None
+        self._bio_dirty = False
+        super().__init__(parent, event_bus, logger)
+
+    def _setup_ui(self):
+        """三栏布局：角色列表 | 固定字段 | MD 编辑器"""
+        # 顶部工具栏
+        toolbar = tk.Frame(self.frame, bg="#f0f0f0", height=36)
+        toolbar.pack(fill="x")
+        toolbar.pack_propagate(False)
+        tk.Label(toolbar, text="角色管理", bg="#f0f0f0",
+                 font=("Microsoft YaHei", 11, "bold")).pack(side="left", padx=8, pady=4)
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", lambda *a: self._refresh_character_list())
+        tk.Entry(toolbar, textvariable=self._search_var, font=("Microsoft YaHei", 9),
+                 width=20).pack(side="left", padx=4)
+        tk.Button(toolbar, text="+ 新角色", command=self._create_character,
+                  font=("Microsoft YaHei", 9), bg="#0078d4", fg="white").pack(side="left", padx=4)
+        tk.Button(toolbar, text="🏷 管理阵营", command=self._show_camp_dialog,
+                  font=("Microsoft YaHei", 9)).pack(side="right", padx=4)
+
+        # 主区域
+        paned = tk.PanedWindow(self.frame, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        # 左：角色列表
+        left_frame = tk.Frame(paned, width=200)
+        paned.add(left_frame)
+        self._char_listbox = tk.Listbox(left_frame, font=("Microsoft YaHei", 10),
+                                         exportselection=False)
+        self._char_listbox.pack(side="left", fill="both", expand=True)
+        self._char_listbox.bind("<<ListboxSelect>>", self._on_character_selected)
+        scroll_l = tk.Scrollbar(left_frame, orient="vertical", command=self._char_listbox.yview)
+        scroll_l.pack(side="right", fill="y")
+        self._char_listbox.configure(yscrollcommand=scroll_l.set)
+
+        # 中：固定字段
+        mid_frame = tk.Frame(paned, width=250)
+        paned.add(mid_frame)
+        tk.Label(mid_frame, text="基本信息", font=("Microsoft YaHei", 10, "bold"),
+                 anchor="w").pack(fill="x", padx=8, pady=4)
+
+        fields = [
+            ("名称:", "name"),
+            ("性别:", "gender"),
+            ("生日:", "birthday"),
+            ("年龄:", "age"),
+        ]
+        self._field_vars: dict[str, tk.StringVar] = {}
+        for label_text, key in fields:
+            row = tk.Frame(mid_frame)
+            row.pack(fill="x", padx=8, pady=3)
+            tk.Label(row, text=label_text, font=("Microsoft YaHei", 9),
+                     width=6, anchor="e").pack(side="left")
+            var = tk.StringVar()
+            var.trace_add("write", self._on_field_changed)
+            self._field_vars[key] = var
+            tk.Entry(row, textvariable=var, font=("Microsoft YaHei", 9)).pack(side="left", fill="x", expand=True)
+
+        # 阵营标签
+        tk.Label(mid_frame, text="阵营标签:", font=("Microsoft YaHei", 9),
+                 anchor="w").pack(fill="x", padx=8, pady=(8, 2))
+        self._camp_tags_frame = tk.Frame(mid_frame)
+        self._camp_tags_frame.pack(fill="x", padx=8)
+
+        tk.Button(mid_frame, text="💾 保存", command=self._save_fields,
+                  font=("Microsoft YaHei", 9), bg="#0078d4", fg="white").pack(pady=8)
+        tk.Button(mid_frame, text="🗑 删除角色", command=self._delete_character,
+                  font=("Microsoft YaHei", 9), fg="#d32f2f").pack()
+
+        # 右：MD 简介编辑器
+        right_frame = tk.Frame(paned, width=500)
+        paned.add(right_frame)
+        tk.Label(right_frame, text="角色简介 (Markdown)", font=("Microsoft YaHei", 10, "bold"),
+                 anchor="w").pack(fill="x", padx=8, pady=4)
+        self._bio_text = tk.Text(right_frame, font=("Microsoft YaHei", 10),
+                                  wrap="word", undo=True)
+        self._bio_text.pack(fill="both", expand=True, padx=8, pady=4)
+        self._bio_text.bind("<<Modified>>", self._on_bio_modified)
+        tk.Button(right_frame, text="💾 保存简介", command=self._save_bio,
+                  font=("Microsoft YaHei", 9), bg="#0078d4", fg="white").pack(pady=4, padx=8, anchor="e")
+
+    def _subscribe_events(self):
+        self._event_bus.subscribe("character:created", lambda e: self._refresh_character_list())
+        self._event_bus.subscribe("character:updated", lambda e: self._refresh_character_list())
+        self._event_bus.subscribe("character:deleted", lambda e: self._on_character_deleted(e))
+        self._event_bus.subscribe("camp:created", lambda e: self._refresh_camp_tags())
+        self._event_bus.subscribe("camp:updated", lambda e: self._refresh_camp_tags())
+        self._event_bus.subscribe("camp:deleted", lambda e: self._refresh_camp_tags())
+
+    def on_show(self):
+        self._refresh_character_list()
+
+    def _auto_save_if_dirty(self):
+        if self._bio_dirty and self._current_char_id:
+            self._save_bio()
+
+    # ── 角色列表 ──
+    def _refresh_character_list(self):
+        self._char_listbox.delete(0, "end")
+        try:
+            cs = self._project_service.character_service
+            keyword = self._search_var.get().strip()
+            chars = cs.search_characters(keyword) if keyword else cs.list_characters()
+            for c in chars:
+                camps_str = ""
+                if c.camp_ids:
+                    camp_names = []
+                    for cid in c.camp_ids:
+                        camp = cs.get_camp(cid)
+                        if camp:
+                            camp_names.append(camp.name)
+                    if camp_names:
+                        camps_str = f"  [{', '.join(camp_names)}]"
+                self._char_listbox.insert("end", f"{c.name}{camps_str}")
+        except Exception:
+            pass
+
+    def _on_character_selected(self, event):
+        sel = self._char_listbox.curselection()
+        if not sel:
+            return
+        self._auto_save_if_dirty()
+        try:
+            cs = self._project_service.character_service
+            keyword = self._search_var.get().strip()
+            chars = cs.search_characters(keyword) if keyword else cs.list_characters()
+            idx = sel[0]
+            if idx < len(chars):
+                char = chars[idx]
+                self._current_char_id = char.char_id
+                full = cs.get_character(char.char_id)
+                if full:
+                    self._field_vars["name"].set(full.name)
+                    self._field_vars["gender"].set(full.gender)
+                    self._field_vars["birthday"].set(full.birthday)
+                    self._field_vars["age"].set(full.age)
+                    self._bio_text.delete("1.0", "end")
+                    self._bio_text.insert("1.0", full.bio)
+                    self._bio_text.edit_modified(False)
+                    self._bio_dirty = False
+                    self._refresh_camp_tags()
+        except Exception:
+            pass
+
+    def _create_character(self):
+        dialog = tk.Toplevel(self.frame)
+        dialog.title("创建角色")
+        dialog.geometry("300x120")
+        dialog.transient(self.frame)
+        dialog.grab_set()
+        tk.Label(dialog, text="角色名称:", font=("Microsoft YaHei", 10)).pack(padx=16, pady=8)
+        name_var = tk.StringVar()
+        entry = tk.Entry(dialog, textvariable=name_var, font=("Microsoft YaHei", 10))
+        entry.pack(padx=16, fill="x")
+        entry.focus_set()
+
+        def _do_create():
+            name = name_var.get().strip()
+            if name:
+                try:
+                    self._project_service.character_service.create_character(name)
+                    self._refresh_character_list()
+                except ValueError as e:
+                    messagebox.showerror("错误", str(e))
+            dialog.destroy()
+
+        entry.bind("<Return>", lambda e: _do_create())
+        tk.Button(dialog, text="创建", command=_do_create,
+                  font=("Microsoft YaHei", 10), bg="#0078d4", fg="white").pack(pady=8)
+
+    def _delete_character(self):
+        if not self._current_char_id:
+            return
+        cs = self._project_service.character_service
+        char = cs.get_character(self._current_char_id)
+        if char and messagebox.askyesno("确认删除", f"确定要删除角色「{char.name}」吗？"):
+            cs.delete_character(self._current_char_id)
+            self._current_char_id = None
+            self._refresh_character_list()
+
+    def _on_character_deleted(self, event):
+        if event.data.get("char_id") == self._current_char_id:
+            self._current_char_id = None
+            self._refresh_character_list()
+
+    # ── 固定字段 ──
+    def _on_field_changed(self, *args):
+        pass  # 字段编辑不立即保存
+
+    def _save_fields(self):
+        if not self._current_char_id:
+            return
+        try:
+            cs = self._project_service.character_service
+            cs.update_character(
+                self._current_char_id,
+                name=self._field_vars["name"].get(),
+                gender=self._field_vars["gender"].get(),
+                birthday=self._field_vars["birthday"].get(),
+                age=self._field_vars["age"].get(),
+            )
+            self._refresh_character_list()
+        except ValueError as e:
+            messagebox.showerror("错误", str(e))
+
+    # ── 阵营标签 ──
+    def _refresh_camp_tags(self):
+        for w in self._camp_tags_frame.winfo_children():
+            w.destroy()
+        if not self._current_char_id:
+            return
+        cs = self._project_service.character_service
+        char = cs.get_character(self._current_char_id)
+        if not char:
+            return
+        for camp_id in char.camp_ids:
+            camp = cs.get_camp(camp_id)
+            if camp:
+                tag_frame = tk.Frame(self._camp_tags_frame, bg="#0078d4")
+                tag_frame.pack(side="left", padx=2)
+                tk.Label(tag_frame, text=camp.name, bg="#0078d4", fg="white",
+                         font=("Microsoft YaHei", 8), padx=4, pady=1).pack(side="left")
+                tk.Label(tag_frame, text="×", bg="#0078d4", fg="white",
+                         font=("Microsoft YaHei", 9, "bold"), cursor="hand2",
+                         padx=2).pack(side="left")
+                # click to remove
+                tag_frame.bind("<Button-1>", lambda e, cid=camp_id: self._remove_camp(cid))
+                for child in tag_frame.winfo_children():
+                    child.bind("<Button-1>", lambda e, cid=camp_id: self._remove_camp(cid))
+
+        # add camp button
+        tk.Button(self._camp_tags_frame, text="+", font=("Microsoft YaHei", 8),
+                  padx=4, command=self._show_camp_dialog).pack(side="left", padx=2)
+
+    def _remove_camp(self, camp_id):
+        if not self._current_char_id:
+            return
+        cs = self._project_service.character_service
+        char = cs.get_character(self._current_char_id)
+        if char:
+            new_ids = [cid for cid in char.camp_ids if cid != camp_id]
+            cs.update_character(self._current_char_id, camp_ids=new_ids)
+            self._refresh_camp_tags()
+
+    def _show_camp_dialog(self):
+        """阵营管理对话框"""
+        dialog = tk.Toplevel(self.frame)
+        dialog.title("管理阵营")
+        dialog.geometry("450x350")
+        dialog.transient(self.frame)
+        dialog.grab_set()
+
+        cs = self._project_service.character_service
+
+        # 列表
+        list_frame = tk.Frame(dialog)
+        list_frame.pack(fill="both", expand=True, padx=8, pady=8)
+        camp_list = tk.Listbox(list_frame, font=("Microsoft YaHei", 10))
+        camp_list.pack(side="left", fill="both", expand=True)
+        sl = tk.Scrollbar(list_frame, orient="vertical", command=camp_list.yview)
+        sl.pack(side="right", fill="y")
+        camp_list.configure(yscrollcommand=sl.set)
+
+        def _refresh_camp_list():
+            camp_list.delete(0, "end")
+            for c in cs.list_camps():
+                desc_preview = c.description[:30] + "..." if len(c.description) > 30 else c.description
+                camp_list.insert("end", f"{c.name}  — {desc_preview}")
+
+        _refresh_camp_list()
+
+        # 编辑区
+        edit_frame = tk.Frame(dialog)
+        edit_frame.pack(fill="x", padx=8, pady=4)
+        tk.Label(edit_frame, text="名称:", font=("Microsoft YaHei", 9)).grid(row=0, column=0, sticky="e", padx=4)
+        name_var = tk.StringVar()
+        tk.Entry(edit_frame, textvariable=name_var, font=("Microsoft YaHei", 9)).grid(row=0, column=1, sticky="ew", pady=2)
+        tk.Label(edit_frame, text="简介:", font=("Microsoft YaHei", 9)).grid(row=1, column=0, sticky="e", padx=4)
+        desc_var = tk.StringVar()
+        tk.Entry(edit_frame, textvariable=desc_var, font=("Microsoft YaHei", 9)).grid(row=1, column=1, sticky="ew", pady=2)
+        edit_frame.columnconfigure(1, weight=1)
+
+        def _on_camp_select(event):
+            sel = camp_list.curselection()
+            if sel:
+                camps = cs.list_camps()
+                if sel[0] < len(camps):
+                    c = camps[sel[0]]
+                    name_var.set(c.name)
+                    desc_var.set(c.description)
+
+        camp_list.bind("<<ListboxSelect>>", _on_camp_select)
+
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(fill="x", padx=8, pady=8)
+
+        def _save_camp():
+            name = name_var.get().strip()
+            if not name:
+                return
+            sel = camp_list.curselection()
+            camps = cs.list_camps()
+            if sel and sel[0] < len(camps):
+                cs.update_camp(camps[sel[0]].camp_id, name=name, description=desc_var.get())
+            else:
+                cs.create_camp(name, desc_var.get())
+            _refresh_camp_list()
+            name_var.set("")
+            desc_var.set("")
+            self._refresh_camp_tags()
+            if self._current_char_id:
+                # auto-add camp to current character
+                new_camps = cs.list_camps()
+                if new_camps:
+                    char = cs.get_character(self._current_char_id)
+                    if char and new_camps[-1].camp_id not in char.camp_ids:
+                        cs.update_character(self._current_char_id,
+                            camp_ids=char.camp_ids + [new_camps[-1].camp_id])
+                        self._refresh_camp_tags()
+
+        def _delete_camp():
+            sel = camp_list.curselection()
+            if sel:
+                camps = cs.list_camps()
+                if sel[0] < len(camps) and messagebox.askyesno("确认删除", f"确定要删除阵营「{camps[sel[0]].name}」吗？"):
+                    cs.delete_camp(camps[sel[0]].camp_id)
+                    _refresh_camp_list()
+                    self._refresh_camp_tags()
+
+        tk.Button(btn_frame, text="新建/更新", command=_save_camp,
+                  font=("Microsoft YaHei", 9), bg="#0078d4", fg="white").pack(side="left", padx=4)
+        tk.Button(btn_frame, text="删除选中", command=_delete_camp,
+                  font=("Microsoft YaHei", 9), fg="#d32f2f").pack(side="left", padx=4)
+        tk.Button(btn_frame, text="关闭", command=dialog.destroy,
+                  font=("Microsoft YaHei", 9)).pack(side="right", padx=4)
+
+    # ── 简介编辑器 ──
+    def _on_bio_modified(self, event=None):
+        if self._bio_text.edit_modified():
+            self._bio_dirty = True
+            self._bio_text.edit_modified(False)
+
+    def _save_bio(self):
+        if not self._current_char_id or not self._bio_dirty:
+            return
+        try:
+            cs = self._project_service.character_service
+            bio = self._bio_text.get("1.0", "end-1c")
+            cs.update_character(self._current_char_id, bio=bio)
+            self._bio_dirty = False
+        except ValueError as e:
+            messagebox.showerror("错误", str(e))
+
+
+# ==================== ForeshadowPanel ★ v2.0 ====================
+
+class ForeshadowPanel(BasePanel):
+    """伏笔管理面板 — 条目式 CRUD，支持隐藏/显示，系统自动排序"""
+
+    def __init__(self, parent, event_bus, logger, project_service: ProjectService):
+        self._project_service = project_service
+        self._show_hidden = tk.BooleanVar(value=True)
+        super().__init__(parent, event_bus, logger)
+
+    def _setup_ui(self):
+        """工具栏 + 伏笔列表 + 底部输入区"""
+        # 工具栏
+        toolbar = tk.Frame(self.frame, bg="#f0f0f0", height=36)
+        toolbar.pack(fill="x")
+        toolbar.pack_propagate(False)
+        tk.Label(toolbar, text="伏笔管理", bg="#f0f0f0",
+                 font=("Microsoft YaHei", 11, "bold")).pack(side="left", padx=8, pady=4)
+        tk.Checkbutton(toolbar, text="显示已隐藏", variable=self._show_hidden,
+                       bg="#f0f0f0", font=("Microsoft YaHei", 9),
+                       command=self._refresh_list).pack(side="right", padx=8)
+
+        # 列表区
+        list_frame = tk.Frame(self.frame)
+        list_frame.pack(fill="both", expand=True)
+        self._foreshadow_tree = ttk.Treeview(list_frame,
+            columns=("content", "status"), show="headings", selectmode="browse")
+        self._foreshadow_tree.heading("content", text="伏笔内容")
+        self._foreshadow_tree.heading("status", text="状态")
+        self._foreshadow_tree.column("content", width=600)
+        self._foreshadow_tree.column("status", width=80, anchor="center")
+        scroll_f = tk.Scrollbar(list_frame, orient="vertical", command=self._foreshadow_tree.yview)
+        self._foreshadow_tree.configure(yscrollcommand=scroll_f.set)
+        self._foreshadow_tree.pack(side="left", fill="both", expand=True)
+        scroll_f.pack(side="right", fill="y")
+        self._foreshadow_tree.bind("<Double-1>", self._on_edit)
+        self._foreshadow_tree.bind("<Button-3>", self._on_right_click)
+
+        # 底部输入栏
+        input_frame = tk.Frame(self.frame, bg="#f0f0f0", height=40)
+        input_frame.pack(fill="x", side="bottom")
+        input_frame.pack_propagate(False)
+        self._foreshadow_input = tk.Text(input_frame, font=("Microsoft YaHei", 10),
+                                          height=2, wrap="word")
+        self._foreshadow_input.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+        tk.Button(input_frame, text="+ 添加", command=self._add_foreshadow,
+                  font=("Microsoft YaHei", 9), bg="#0078d4", fg="white").pack(side="right", padx=4, pady=4)
+
+        # 右键菜单
+        self._context_menu = tk.Menu(self.frame, tearoff=0)
+        self._context_menu.add_command(label="编辑内容", command=self._on_edit)
+        self._context_menu.add_command(label="隐藏/显示", command=self._on_toggle)
+        self._context_menu.add_separator()
+        self._context_menu.add_command(label="删除", command=self._on_delete)
+
+    def _subscribe_events(self):
+        self._event_bus.subscribe("foreshadow:created", lambda e: self._refresh_list())
+        self._event_bus.subscribe("foreshadow:updated", lambda e: self._refresh_list())
+        self._event_bus.subscribe("foreshadow:deleted", lambda e: self._refresh_list())
+        self._event_bus.subscribe("foreshadow:toggled", lambda e: self._refresh_list())
+
+    def on_show(self):
+        self._refresh_list()
+
+    def _refresh_list(self):
+        self._foreshadow_tree.delete(*self._foreshadow_tree.get_children())
+        try:
+            fs = self._project_service.foreshadow_service
+            include = self._show_hidden.get()
+            items = fs.list_foreshadows(include_hidden=include)
+            for f in items:
+                status = "👁 隐藏" if f.hidden else "◎"
+                tags = ("hidden",) if f.hidden else ()
+                self._foreshadow_tree.insert("", "end", values=(f.content, status), tags=tags)
+            self._foreshadow_tree.tag_configure("hidden", foreground="gray")
+            # 更新计数
+            count = len(items)
+            hidden_count = sum(1 for f_ in items if f_.hidden)
+            self.logger.log(f"伏笔: {count} 条 (含 {hidden_count} 隐藏)", "ForeshadowPanel", "INFO")
+        except Exception:
+            pass
+
+    def _add_foreshadow(self):
+        content = self._foreshadow_input.get("1.0", "end-1c").strip()
+        if not content:
+            return
+        try:
+            self._project_service.foreshadow_service.add_foreshadow(content)
+            self._foreshadow_input.delete("1.0", "end")
+            self._refresh_list()
+        except ValueError as e:
+            messagebox.showerror("错误", str(e))
+
+    def _get_selected_id(self):
+        sel = self._foreshadow_tree.selection()
+        if not sel:
+            return None
+        fs = self._project_service.foreshadow_service
+        include = self._show_hidden.get()
+        items = fs.list_foreshadows(include_hidden=include)
+        idx = self._foreshadow_tree.index(sel[0])
+        if idx < len(items):
+            return items[idx].foreshadow_id
+        return None
+
+    def _on_edit(self, event=None):
+        fid = self._get_selected_id()
+        if not fid:
+            return
+        fs = self._project_service.foreshadow_service
+        f = fs.get_foreshadow(fid)
+        if not f:
+            return
+        dialog = tk.Toplevel(self.frame)
+        dialog.title("编辑伏笔")
+        dialog.geometry("400x200")
+        dialog.transient(self.frame)
+        dialog.grab_set()
+        text = tk.Text(dialog, font=("Microsoft YaHei", 10), wrap="word")
+        text.insert("1.0", f.content)
+        text.pack(fill="both", expand=True, padx=8, pady=8)
+
+        def _save():
+            new_content = text.get("1.0", "end-1c").strip()
+            if new_content:
+                fs.update_foreshadow(fid, new_content)
+                self._refresh_list()
+            dialog.destroy()
+
+        tk.Button(dialog, text="保存", command=_save,
+                  font=("Microsoft YaHei", 10), bg="#0078d4", fg="white").pack(pady=4)
+
+    def _on_toggle(self, event=None):
+        fid = self._get_selected_id()
+        if fid:
+            self._project_service.foreshadow_service.toggle_hidden(fid)
+            self._refresh_list()
+
+    def _on_delete(self, event=None):
+        fid = self._get_selected_id()
+        if fid and messagebox.askyesno("确认删除", "确定要删除这条伏笔吗？"):
+            try:
+                self._project_service.foreshadow_service.delete_foreshadow(fid)
+                self._refresh_list()
+            except ValueError as e:
+                messagebox.showerror("错误", str(e))
+
+    def _on_right_click(self, event):
+        sel = self._foreshadow_tree.identify_row(event.y)
+        if sel:
+            self._foreshadow_tree.selection_set(sel)
+            self._context_menu.post(event.x_root, event.y_root)
+
+    def get_ai_context(self) -> str:
+        """供 ChatPanel 调用：获取未隐藏伏笔的格式化文本"""
+        try:
+            return self._project_service.foreshadow_service.get_ai_context()
+        except Exception:
+            return ""
+
+
+# ==================== StatusPanel ★ v2.0 ====================
+
+class StatusPanel(BasePanel):
+    """创作状态面板 — 展示进度 + AI 一键生成"""
+
+    def __init__(self, parent, event_bus, logger, project_service: ProjectService):
+        self._project_service = project_service
+        self._ai_client: "AIClient | None" = None
+        self._status_content = tk.StringVar(value="（暂无数据，请选择项目后使用 AI 生成）")
+        super().__init__(parent, event_bus, logger)
+
+    def set_ai_client(self, ai_client: "AIClient"):
+        self._ai_client = ai_client
+
+    def _setup_ui(self):
+        """状态展示 + AI 生成按钮"""
+        # 标题
+        tk.Label(self.frame, text="创作状态", font=("Microsoft YaHei", 12, "bold"),
+                 anchor="w").pack(fill="x", padx=12, pady=8)
+
+        # Token 警告提示
+        warning_frame = tk.Frame(self.frame, bg="#fff3cd", bd=1, relief="solid")
+        warning_frame.pack(fill="x", padx=12, pady=4)
+        tk.Label(warning_frame, text="⚠️ 提示：AI 生成功能需要将大量创作数据(大纲 L1~L4 + 角色 + 设定 + 伏笔)"
+                 "上传至 AI 进行分析，预计消耗较多 token。请确认后使用。",
+                 bg="#fff3cd", fg="#856404", font=("Microsoft YaHei", 9),
+                 wraplength=700, justify="left").pack(padx=8, pady=6)
+
+        # 状态内容区
+        content_frame = tk.Frame(self.frame)
+        content_frame.pack(fill="both", expand=True, padx=12, pady=4)
+        self._status_display = tk.Text(content_frame, font=("Microsoft YaHei", 10),
+                                        wrap="word", state="disabled")
+        self._status_display.pack(side="left", fill="both", expand=True)
+        scroll = tk.Scrollbar(content_frame, orient="vertical", command=self._status_display.yview)
+        scroll.pack(side="right", fill="y")
+        self._status_display.configure(yscrollcommand=scroll.set)
+
+        # AI 生成按钮
+        btn_frame = tk.Frame(self.frame)
+        btn_frame.pack(fill="x", padx=12, pady=8)
+        tk.Button(btn_frame, text="🤖 AI 一键生成创作状态",
+                  font=("Microsoft YaHei", 11), bg="#0078d4", fg="white",
+                  padx=16, pady=6, command=self._on_ai_generate).pack()
+
+    def on_show(self):
+        self._refresh_basic_status()
+
+    def _refresh_basic_status(self):
+        """刷新基础统计（不调用 AI）"""
+        try:
+            ps = self._project_service
+            if not ps.get_current_project():
+                return
+            tree = ps.get_outline_tree()
+            total_nodes = len(tree)
+            completed = sum(1 for n in tree if n.status.value == "completed")
+            l5_nodes = [n for n in tree if n.level.value == 5]
+            total_words = sum(n.word_count for n in l5_nodes)
+
+            lines = [
+                "📊 基本信息",
+                f"   当前项目: {ps.get_current_project()}",
+                f"   总大纲节点: {total_nodes}",
+                f"   已完成节点: {completed}",
+                f"   L5 正文章节数: {len(l5_nodes)}",
+                f"   总字数: {total_words:,}",
+                "",
+                "💡 点击下方按钮，让 AI 分析并生成完整的创作状态摘要。",
+            ]
+            self._set_status_content("\n".join(lines))
+        except Exception:
+            pass
+
+    def _set_status_content(self, text: str):
+        self._status_display.config(state="normal")
+        self._status_display.delete("1.0", "end")
+        self._status_display.insert("1.0", text)
+        self._status_display.config(state="disabled")
+
+    def _on_ai_generate(self):
+        if not self._ai_client:
+            messagebox.showwarning("未配置 AI", "请先在配置面板中配置并测试 AI 连接。")
+            return
+
+        if not self._ai_client.is_configured:
+            messagebox.showwarning("AI 未配置", "请先在配置面板中配置 AI 源。")
+            return
+
+        # Token 消耗确认
+        if not messagebox.askyesno(
+            "Token 消耗提醒",
+            "此功能需要将大量创作数据上传至 AI 进行分析，预计消耗较多 token。\n\n"
+            "上传内容：\n"
+            "• 大纲 L1~L4（不含正文 L5）\n"
+            "• 角色栏所有角色信息\n"
+            "• 设定栏所有设定信息\n"
+            "• 伏笔栏未隐藏的伏笔信息\n\n"
+            "是否继续？"
+        ):
+            return
+
+        # 收集数据
+        try:
+            ps = self._project_service
+            data_parts = []
+
+            # 1. 大纲 L1~L4
+            outline_nodes = [n for n in ps.get_outline_tree() if n.level.value <= 4]
+            if outline_nodes:
+                data_parts.append("【大纲结构】")
+                for n in outline_nodes:
+                    level_name = {1: "L1-大纲", 2: "L2-卷纲", 3: "L3-简纲", 4: "L4-章纲"}.get(n.level.value, "")
+                    node = ps.get_node(n.node_id)
+                    content_preview = (node.content[:300] + "...") if node and node.content else "(无内容)"
+                    data_parts.append(f"- [{level_name}] {n.title}\n  {content_preview}")
+
+            # 2. 角色信息
+            cs = ps.character_service
+            char_ctx = cs.get_ai_context()
+            if char_ctx:
+                data_parts.append("\n" + char_ctx)
+
+            # 3. 设定信息
+            categories = ps.list_categories()
+            if categories:
+                data_parts.append("\n【设定分类】")
+                for cat in categories:
+                    docs = ps.list_docs(cat)
+                    if docs:
+                        data_parts.append(f"\n## {cat}")
+                        for doc_name in docs[:5]:  # 每分类最多5篇
+                            content = ps.get_setting(cat, doc_name)
+                            if content:
+                                preview = content[:200] + "..." if len(content) > 200 else content
+                                data_parts.append(f"- {doc_name}: {preview}")
+
+            # 4. 伏笔信息
+            fs = ps.foreshadow_service
+            foreshadow_ctx = fs.get_ai_context()
+            if foreshadow_ctx:
+                data_parts.append("\n" + foreshadow_ctx)
+
+            full_data = "\n".join(data_parts)
+
+            # 构建 prompt
+            prompt = (
+                "你是一位专业的小说创作分析助手。请根据以下创作数据，生成一份结构化的创作状态摘要。\n\n"
+                "请包含以下内容：\n"
+                "1. 📖 整体进度概览（大纲完成度、正文完成度）\n"
+                "2. 📈 各故事线分析（识别主要故事线，评估各自进度）\n"
+                "3. 👤 角色使用情况（主要角色是否都有足够的出场和设定）\n"
+                "4. 🔮 伏笔回收状态（列出已知伏笔，评估回收进度）\n"
+                "5. 💡 创作建议（基于当前进度给出下一步创作方向）\n\n"
+                "=== 创作数据 ===\n"
+                f"{full_data}"
+            )
+
+            messages = [ChatMessage("user", prompt)]
+
+            # 调用 AI
+            self._set_status_content("⏳ AI 正在分析创作数据...")
+
+            import threading
+            result_buffer = []
+
+            def _generate():
+                try:
+                    for chunk in self._ai_client.chat_stream(messages):
+                        if chunk:
+                            result_buffer.append(chunk)
+                    full_text = "".join(result_buffer)
+                    self.frame.after(0, lambda: self._set_status_content(full_text))
+                except Exception as e:
+                    self.frame.after(0, lambda: self._set_status_content(f"❌ 生成失败: {e}"))
+
+            threading.Thread(target=_generate, daemon=True).start()
+
+        except Exception as e:
+            self._set_status_content(f"❌ 数据收集失败: {e}")
+
+    def get_ai_context(self) -> str:
+        """供 ChatPanel 调用：获取当前状态摘要"""
+        try:
+            content = self._status_display.get("1.0", "end-1c")
+            if content and "暂无数据" not in content and "AI 正在分析" not in content:
+                return f"【当前创作状态】\n{content}"
+        except Exception:
+            pass
+        return ""
+
+
+# ==================== LogPanel ★ v2.0 修复 ====================
 
 class LogPanel(BasePanel):
-    """日志查看面板"""
+    """日志查看面板 — v2.0: 加载历史日志 + 移除显示上限"""
 
     def __init__(self, parent, event_bus, logger, config_manager: ConfigManager):
         self._config_manager = config_manager
         self._log_entries = []  # [(timestamp, level, module, message)]
+        self._log_loaded = False  # ★ 历史日志是否已加载
         super().__init__(parent, event_bus, logger)
 
     def _setup_ui(self):
@@ -2332,20 +3094,64 @@ class LogPanel(BasePanel):
     def _subscribe_events(self):
         self._event_bus.subscribe("log:new", self._on_new_log)
 
+    # ★ v2.0: 切换到日志面板时加载历史日志
+    def on_show(self):
+        if not self._log_loaded:
+            self._load_history_logs()
+            self._log_loaded = True
+
+    def _load_history_logs(self):
+        """★ v2.0: 从磁盘加载当日历史日志"""
+        import glob
+        try:
+            work_dir = self._config_manager.get_work_dir()
+            today = datetime.now().strftime("%Y-%m-%d")
+            log_dir = os.path.join(work_dir, "logs", today)
+            if not os.path.exists(log_dir):
+                return
+            count = 0
+            for log_file in sorted(glob.glob(os.path.join(log_dir, "*.log"))):
+                try:
+                    with open(log_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            # 解析格式: [2025-07-20 14:30:01] [INFO] [Module] message
+                            try:
+                                parts = line.split("] ", 3)
+                                if len(parts) >= 4:
+                                    ts = parts[0].lstrip("[")
+                                    level = parts[1].lstrip("[")
+                                    module = parts[2].lstrip("[")
+                                    message = parts[3]
+                                    self._log_entries.append((ts, level, module, message))
+                                    count += 1
+                            except (IndexError, ValueError):
+                                pass
+                except Exception:
+                    pass
+            if count > 0:
+                self.logger.log(f"加载历史日志 {count} 条", "LogPanel", "INFO")
+                self._apply_filter()
+        except Exception as e:
+            self.logger.log(f"加载历史日志失败: {e}", "LogPanel", "WARNING")
+
     def _on_new_log(self, event):
         """收到新日志"""
         d = event.data
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._log_entries.append((ts, d.get("level", "INFO"), d.get("module_id", ""), d.get("message", "")))
-        # 限制缓存
-        if len(self._log_entries) > 500:
-            self._log_entries = self._log_entries[-500:]
+        # ★ v2.0: 内存上限 500 → 2000
+        if len(self._log_entries) > 2000:
+            self._log_entries = self._log_entries[-2000:]
         self._apply_filter()
 
     def _apply_filter(self):
+        """★ v2.0: 移除 [-200:] 截断，完整展示"""
         level_filter = self._level_var.get()
         self._log_tree.delete(*self._log_tree.get_children())
-        for entry in reversed(self._log_entries[-200:]):
+        for entry in reversed(self._log_entries):
             if level_filter != "全部" and entry[1] != level_filter:
                 continue
             self._log_tree.insert("", "end", values=entry)

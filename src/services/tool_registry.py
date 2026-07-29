@@ -90,6 +90,7 @@ def create_tools(project_service) -> ToolRegistry:
                     "title": n.title,
                     "level": n.level.name,
                     "parent_id": n.parent_id,
+                    "children_ids": n.children_ids,
                     "status": n.status.value,
                 }
                 for n in project_service.get_outline_tree()
@@ -127,27 +128,18 @@ def create_tools(project_service) -> ToolRegistry:
 
     registry.register(ToolDef(
         name="read_setting",
-        description="读取设定文档（支持单个或批量），传入分类名 + 文档名(或文档名列表)",
+        description="读取指定设定文档的完整 Markdown 内容",
         parameters={
             "type": "object",
             "properties": {
                 "category": {"type": "string", "description": "设定分类名"},
-                "doc": {"type": "string", "description": "文档名（不含 .md），单个读取时使用"},
-                "docs": {"type": "array", "items": {"type": "string"},
-                         "description": "文档名列表，批量读取时使用（如 [\"斗气\", \"魔法\"]）"},
+                "doc": {"type": "string", "description": "文档名（不含 .md）"},
             },
-            "required": ["category"],
+            "required": ["category", "doc"],
         },
-        handler=lambda args: (
-            # 优先批量
-            {doc: project_service.get_setting(args["category"], doc) or "(不存在)"
-             for doc in args["docs"]}
-            if "docs" in args
-            # 单文档向后兼容
-            else {"content": project_service.get_setting(args["category"], args.get("doc", "")) or "(文档不存在)"}
-            if "doc" in args
-            else {"error": "请提供 doc 或 docs 参数"}
-        ),
+        handler=lambda args: {
+            "content": project_service.get_setting(args["category"], args["doc"]) or "(文档不存在)",
+        },
     ))
 
     registry.register(ToolDef(
@@ -171,75 +163,94 @@ def create_tools(project_service) -> ToolRegistry:
     # ── 大纲与章节工具 ──
 
     registry.register(ToolDef(
-        name="read_nodes",
-        description="读取大纲节点/章节的 Markdown 内容（支持单个或批量）。先通过 list_outline 了解节点结构",
+        name="read_chapter",
+        description="读取指定大纲节点或章节的 Markdown 内容。请先通过 list_outline 了解节点结构",
         parameters={
             "type": "object",
             "properties": {
-                "node_id": {"type": "string", "description": "单个节点 ID"},
-                "node_ids": {"type": "array", "items": {"type": "string"},
-                             "description": "节点 ID 列表，批量读取时使用"},
+                "node_id": {"type": "string", "description": "大纲节点 ID"},
             },
-            "required": [],
+            "required": ["node_id"],
         },
         handler=lambda args: (
-            {nid: project_service.get_node(nid).content if project_service.get_node(nid) else "(不存在)"
-             for nid in args["node_ids"]}
-            if "node_ids" in args
-            else {"content": project_service.get_node(args["node_id"]).content}
-            if "node_id" in args and project_service.get_node(args["node_id"])
-            else {"error": f"节点 {args.get('node_id')} 不存在"}
-            if "node_id" in args
-            else {"error": "请提供 node_id 或 node_ids 参数"}
+            {"content": project_service.get_node(args["node_id"]).content}
+            if project_service.get_node(args["node_id"])
+            else {"error": "节点不存在"}
         ),
     ))
 
     registry.register(ToolDef(
-        name="create_nodes",
-        description="创建/覆写大纲节点。支持批量创建：传入 nodes 数组一次创建多个；覆写时传 node_id",
+        name="write_chapter",
+        description="创建新的大纲节点/章节，或通过 node_id 覆写已有节点的 Markdown 内容",
         parameters={
             "type": "object",
             "properties": {
-                "node_id": {"type": "string", "description": "覆写已有节点的ID（更新时用）"},
-                "parent_id": {"type": "string", "description": "父节点ID（创建时用；顶层不传）"},
-                "title": {"type": "string", "description": "节点标题"},
+                "node_id": {"type": "string", "description": "要覆写的已有节点ID（更新时传入；不传则创建新节点）"},
+                "parent_id": {"type": "string", "description": "父节点ID，创建新节点时使用（如创建顶级节点则不传）"},
+                "title": {"type": "string", "description": "节点标题（覆写时可选，不传则保留原标题）"},
                 "content": {"type": "string", "description": "Markdown 内容"},
-                "level": {"type": "integer", "description": "层级:1大纲 2卷 3简纲 4章纲 5正文"},
-                "nodes": {"type": "array", "items": {"type": "object", "properties": {
-                    "title": {"type": "string"}, "content": {"type": "string"},
-                    "level": {"type": "integer"},
-                }}, "description": "批量创建的子节点数组，每项含 title、content、可选 level"},
+                "level": {"type": "integer", "description": "层级: 1=大纲 2=卷 3=简纲 4=章纲 5=正文（仅创建新节点时使用）"},
             },
-            "required": [],
+            "required": ["content"],
         },
         handler=lambda args: (
-            # 批量创建
-            {"created": [
-                {"id": (n := project_service.create_node(
-                    args.get("parent_id"), item["title"],
-                    OutlineLevel(item.get("level", args.get("level", 5))),
-                    item["content"],
-                )).node_id, "title": n.title}
-                for item in args["nodes"]
-            ]}
-            if "nodes" in args
-            # 覆写已有
-            else {"updated": args["node_id"], "title": project_service.update_node(
-                args["node_id"], title=args.get("title"), content=args.get("content", "")
-            ).title}
-            if args.get("node_id") and project_service.get_node(args["node_id"])
-            else {"error": f"节点 {args.get('node_id')} 不存在"}
-            if args.get("node_id")
-            # 单个创建
-            else {"created": (
-                n := project_service.create_node(
-                    args.get("parent_id"), args.get("title", "未命名"),
-                    OutlineLevel(args.get("level", 5)), args.get("content", ""),
+            # 覆写已有节点
+            (
+                lambda nid: (
+                    {"updated": nid, "title": project_service.update_node(nid, title=args.get("title"), content=args["content"]).title}
+                    if project_service.get_node(nid)
+                    else {"error": f"节点 {nid} 不存在"}
                 )
-            ).node_id, "title": n.title}
-            if args.get("content")
-            else {"error": "请提供 content、node_id 或 nodes 参数"}
+            )(args["node_id"])
+            if args.get("node_id")
+            # 创建新节点
+            else (
+                lambda: (
+                    node := project_service.create_node(
+                        args.get("parent_id"), args.get("title", "未命名"),
+                        OutlineLevel(args.get("level", 5)),
+                        args["content"],
+                    )
+                ) and {"created": node.node_id, "title": node.title}
+            )()
         ),
+    ))
+
+    # ── 批量读取工具 ──
+
+    registry.register(ToolDef(
+        name="read_settings",
+        description="批量读取多个设定文档的内容。传入分类名和文档名列表，一次获取多份设定，用于需要同时了解多个相关设定的场景",
+        parameters={
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "description": "设定分类名"},
+                "docs": {"type": "array", "items": {"type": "string"},
+                         "description": "要读取的文档名列表，如 [\"斗气体系\", \"魔法体系\"]"},
+            },
+            "required": ["category", "docs"],
+        },
+        handler=lambda args: {
+            doc: project_service.get_setting(args["category"], doc) or "(不存在)"
+            for doc in args["docs"]
+        },
+    ))
+
+    registry.register(ToolDef(
+        name="read_outline_nodes",
+        description="批量读取多个大纲节点的内容。传入节点ID列表，一次获取多个节点的 Markdown 内容",
+        parameters={
+            "type": "object",
+            "properties": {
+                "node_ids": {"type": "array", "items": {"type": "string"},
+                             "description": "要读取的节点ID列表"},
+            },
+            "required": ["node_ids"],
+        },
+        handler=lambda args: {
+            nid: (project_service.get_node(nid).content if project_service.get_node(nid) else "(不存在)")
+            for nid in args["node_ids"]
+        },
     ))
 
     # ── 精准编辑工具（行/列级）──
@@ -332,6 +343,196 @@ def create_tools(project_service) -> ToolRegistry:
         },
         handler=lambda args: {
             "results": project_service.search_content(args["keyword"]),
+        },
+    ))
+
+    # ═══════════════════════════════════════════════════
+    # ★ v2.0: 角色/阵营工具
+    # ═══════════════════════════════════════════════════
+
+    registry.register(ToolDef(
+        name="list_characters",
+        description="列出当前小说的所有角色，包含名称、性别和所属阵营。用于了解有哪些角色及其基本信息",
+        parameters={"type": "object", "properties": {}, "required": []},
+        handler=lambda args: {
+            "characters": [
+                {
+                    "char_id": c.char_id,
+                    "name": c.name,
+                    "gender": c.gender,
+                    "camps": [
+                        project_service.character_service.get_camp(cid).name
+                        if project_service.character_service.get_camp(cid)
+                        else cid
+                        for cid in c.camp_ids
+                    ],
+                }
+                for c in project_service.character_service.list_characters()
+            ]
+        },
+    ))
+
+    registry.register(ToolDef(
+        name="read_character",
+        description="读取指定角色的完整信息，包含简介（Markdown）、性别、年龄、生日、所属阵营等",
+        parameters={
+            "type": "object",
+            "properties": {
+                "char_id": {"type": "string", "description": "角色 ID（通过 list_characters 获取）"},
+            },
+            "required": ["char_id"],
+        },
+        handler=lambda args: (
+            lambda ch: (
+                {
+                    "char_id": ch.char_id,
+                    "name": ch.name,
+                    "gender": ch.gender,
+                    "age": ch.age,
+                    "birthday": ch.birthday,
+                    "bio": ch.bio,
+                    "camps": [
+                        project_service.character_service.get_camp(cid).name
+                        if project_service.character_service.get_camp(cid)
+                        else cid
+                        for cid in ch.camp_ids
+                    ],
+                }
+                if ch else {"error": "角色不存在"}
+            )
+        )(project_service.character_service.get_character(args["char_id"])),
+    ))
+
+    registry.register(ToolDef(
+        name="write_character",
+        description="创建新角色或更新已有角色信息。可修改名称、简介（Markdown）、性别、年龄、生日、阵营标签等",
+        parameters={
+            "type": "object",
+            "properties": {
+                "char_id": {"type": "string", "description": "角色 ID（更新时传入；不传则创建新角色）"},
+                "name": {"type": "string", "description": "角色名称（创建时必填；更新时可选）"},
+                "gender": {"type": "string", "description": "性别"},
+                "age": {"type": "string", "description": "年龄"},
+                "birthday": {"type": "string", "description": "生日"},
+                "bio": {"type": "string", "description": "角色简介（Markdown 格式）"},
+                "camp_ids": {"type": "array", "items": {"type": "string"},
+                             "description": "要设置的阵营 ID 列表（会覆盖原有阵营）"},
+            },
+            "required": [],
+        },
+        handler=lambda args: (
+            # 更新已有角色
+            (
+                lambda: project_service.character_service.update_character(
+                    args["char_id"],
+                    name=args.get("name"),
+                    gender=args.get("gender"),
+                    age=args.get("age"),
+                    birthday=args.get("birthday"),
+                    bio=args.get("bio"),
+                    camp_ids=args.get("camp_ids"),
+                )
+                and {"updated": args["char_id"], "name": project_service.character_service.get_character(args["char_id"]).name}
+            )()
+            if args.get("char_id") and project_service.character_service.get_character(args["char_id"])
+            # 创建新角色
+            else (
+                {"created": project_service.character_service.create_character(args.get("name", "未命名")).char_id,
+                 "name": args.get("name", "未命名")}
+                if not args.get("char_id")
+                else {"error": f"角色不存在: {args['char_id']}"}
+            )
+        ),
+    ))
+
+    registry.register(ToolDef(
+        name="list_camps",
+        description="列出当前小说的所有阵营（势力），包含名称和简介",
+        parameters={"type": "object", "properties": {}, "required": []},
+        handler=lambda args: {
+            "camps": [
+                {"camp_id": c.camp_id, "name": c.name, "description": c.description}
+                for c in project_service.character_service.list_camps()
+            ]
+        },
+    ))
+
+    # ═══════════════════════════════════════════════════
+    # ★ v2.0: 伏笔工具
+    # ═══════════════════════════════════════════════════
+
+    registry.register(ToolDef(
+        name="list_foreshadows",
+        description="列出当前小说所有未隐藏的伏笔条目",
+        parameters={"type": "object", "properties": {}, "required": []},
+        handler=lambda args: {
+            "foreshadows": [
+                {"id": f.foreshadow_id, "content": f.content, "order": f.order}
+                for f in project_service.foreshadow_service.list_foreshadows(include_hidden=False)
+            ]
+        },
+    ))
+
+    registry.register(ToolDef(
+        name="read_foreshadow",
+        description="读取单条伏笔的完整信息",
+        parameters={
+            "type": "object",
+            "properties": {
+                "foreshadow_id": {"type": "string", "description": "伏笔 ID"},
+            },
+            "required": ["foreshadow_id"],
+        },
+        handler=lambda args: (
+            lambda f: (
+                {"id": f.foreshadow_id, "content": f.content, "hidden": f.hidden,
+                 "created_at": f.created_at}
+                if f else {"error": "伏笔不存在"}
+            )
+        )(project_service.foreshadow_service.get_foreshadow(args["foreshadow_id"])),
+    ))
+
+    registry.register(ToolDef(
+        name="write_foreshadow",
+        description="添加新伏笔条目。伏笔是散布在故事中等待回收的线索",
+        parameters={
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "伏笔内容描述"},
+            },
+            "required": ["content"],
+        },
+        handler=lambda args: {
+            "created": project_service.foreshadow_service.add_foreshadow(args["content"]).foreshadow_id
+        },
+    ))
+
+    # ═══════════════════════════════════════════════════
+    # ★ v2.0: 状态工具
+    # ═══════════════════════════════════════════════════
+
+    registry.register(ToolDef(
+        name="get_status",
+        description="获取当前小说的创作进度摘要，包含大纲节点数、完成率、正文字数等统计信息",
+        parameters={"type": "object", "properties": {}, "required": []},
+        handler=lambda args: {
+            "status": {
+                "current_project": project_service.get_current_project(),
+                "total_nodes": len(project_service.get_outline_tree()),
+                "completed_nodes": sum(
+                    1 for n in project_service.get_outline_tree()
+                    if n.status.value == "completed"
+                ),
+                "l1_count": len(project_service.get_nodes_by_level(OutlineLevel.OUTLINE)),
+                "l2_count": len(project_service.get_nodes_by_level(OutlineLevel.VOLUME)),
+                "l3_count": len(project_service.get_nodes_by_level(OutlineLevel.BRIEF)),
+                "l4_count": len(project_service.get_nodes_by_level(OutlineLevel.CHAPTER)),
+                "l5_count": len(project_service.get_nodes_by_level(OutlineLevel.CONTENT)),
+                "total_words": sum(
+                    n.word_count
+                    for n in project_service.get_nodes_by_level(OutlineLevel.CONTENT)
+                ),
+            }
         },
     ))
 

@@ -27,6 +27,7 @@ from src.services.session_manager import SessionManager
 from src.services.project_service import ProjectService
 from src.ui.panels import (
     BasePanel, ChatPanel, OutlinePanel, SettingsPanel, ConfigPanel, LogPanel,
+    CharacterPanel, ForeshadowPanel, StatusPanel,
 )
 from src.services.tool_registry import create_tools
 
@@ -35,11 +36,14 @@ class MainWindow:
     """应用程序主窗口"""
 
     NAV_ITEMS = [
-        ("chat",     "💬 对话",    "ChatPanel"),
-        ("outline",  "📖 大纲",    "OutlinePanel"),
-        ("settings", "⚙ 设定",     "SettingsPanel"),
-        ("config",   "🔧 配置",    "ConfigPanel"),
-        ("log",      "📋 日志",    "LogPanel"),
+        ("chat",        "💬 对话",    "ChatPanel"),
+        ("outline",     "📖 大纲",    "OutlinePanel"),
+        ("characters",  "👤 角色",    "CharacterPanel"),
+        ("foreshadow",  "🔮 伏笔",    "ForeshadowPanel"),
+        ("settings",    "⚙ 设定",     "SettingsPanel"),
+        ("status",      "📊 状态",    "StatusPanel"),
+        ("config",      "🔧 配置",    "ConfigPanel"),
+        ("log",         "📋 日志",    "LogPanel"),
     ]
 
     SIDEBAR_WIDTH = 170
@@ -181,6 +185,15 @@ class MainWindow:
             self._project_service,
         )
         self._panels["outline"].set_ai_client(self._ai_client)
+        # ★ v2.0: 新增面板
+        self._panels["characters"] = CharacterPanel(
+            self._content_frame, self._event_bus, self._logger,
+            self._project_service,
+        )
+        self._panels["foreshadow"] = ForeshadowPanel(
+            self._content_frame, self._event_bus, self._logger,
+            self._project_service,
+        )
         self._panels["settings"] = SettingsPanel(
             self._content_frame, self._event_bus, self._logger,
             self._project_service,
@@ -193,6 +206,12 @@ class MainWindow:
             self._content_frame, self._event_bus, self._logger,
             self._config_manager,
         )
+        # ★ v2.0
+        self._panels["status"] = StatusPanel(
+            self._content_frame, self._event_bus, self._logger,
+            self._project_service,
+        )
+        self._panels["status"].set_ai_client(self._ai_client)
 
     def _subscribe_events(self) -> None:
         """订阅全局事件"""

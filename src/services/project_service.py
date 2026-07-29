@@ -1,50 +1,44 @@
 """
-项目服务 — 管理项目、大纲层级（5 级）、正文、设定
+项目与设定服务 — ProjectService v2.0
 
-特性:
-  - 5 级大纲: L1 大纲 → L2 卷纲 → L3 简纲 → L4 章纲 → L5 正文
-  - 8 步创作流程: 灵感搭建→基础设定→设定细化→剧情大纲→卷章划分→单卷细化→分割内容→内容细纲
-  - 大纲节点 CRUD、拆分、合并、移动（升降级）
-  - 力量体系 + 角色设定管理（跨势力双写）
-  - 设定导出为 Markdown
+核心职责:
+  - 项目管理（创建/删除/切换小说项目）
+  - 大纲层级管理（5 级内容体系：大纲→卷纲→简纲→章纲→正文）
+  - 通用自由分类设定管理（Markdown 文档）
+  - ★ CharacterService — 角色结构化 CRUD + 阵营管理 + 多标签关联
+  - ★ ForeshadowService — 伏笔条目 CRUD + 隐藏/显示 + AI 上下文
 
-数据存储:
-    workspace/projects/{项目名}/
-    ├── project.json           # 项目元数据 + 流程步骤
-    ├── outline.json           # 大纲树索引
-    ├── outline/               # L1~L4 大纲内容 .md
-    ├── content/               # L5 正文 .md
-    └── settings/              # 力量体系 + 角色设定
+设计模式: 服务层 (Service Layer) + 仓储模式 (Repository)
 """
 
 from __future__ import annotations
 
 import json
 import os
-import uuid
 import shutil
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Optional
-from dataclasses import dataclass, field
-from enum import Enum, IntEnum
-
-from src.core.event_bus import EventBus
-from src.core.logger import Logger
 
 
-# ==================== 枚举与数据类 ====================
+# ═══════════════════════════════════════════════════
+# 枚举与数据类
+# ═══════════════════════════════════════════════════
 
-class OutlineLevel(IntEnum):
-    """大纲层级"""
-    OUTLINE = 1      # L1 大纲（全书）
-    VOLUME = 2       # L2 卷纲
-    BRIEF = 3        # L3 简纲（10~20章）
-    CHAPTER = 4      # L4 章纲（3~6章）
-    CONTENT = 5      # L5 正文
+class OutlineLevel(Enum):
+    """大纲层级 (v1.0)"""
+    OUTLINE = 1   # L1 大纲（全书）
+    VOLUME = 2    # L2 卷纲
+    BRIEF = 3     # L3 简纲（10~20章）
+    CHAPTER = 4   # L4 章纲（3~6章）
+    CONTENT = 5   # L5 正文
 
 
-class NodeStatus(str, Enum):
+class NodeStatus(Enum):
+    """节点状态 (v1.0)"""
     TODO = "todo"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
@@ -53,408 +47,1074 @@ class NodeStatus(str, Enum):
 
 @dataclass
 class ProjectMeta:
-    """项目元数据"""
+    """项目元数据 (v1.0)"""
     name: str
     created_at: str = ""
     updated_at: str = ""
     description: str = ""
-    current_step: int = 1  # 创作流程步骤 1~8
+    current_step: int = 1
 
 
 @dataclass
 class OutlineNode:
-    """大纲节点（5 级内容层级中的任意节点）"""
+    """大纲节点 (v1.0)"""
     node_id: str
     title: str
     level: OutlineLevel
-    parent_id: Optional[str]
+    parent_id: str | None
     children_ids: list[str] = field(default_factory=list)
     status: NodeStatus = NodeStatus.TODO
     order: int = 0
     content: str = ""
-    file: str = ""
     word_count: int = 0
     created_at: str = ""
     updated_at: str = ""
 
 
-# L5 正文兼容别名
+# 向后兼容别名 (v1.0)
 Chapter = OutlineNode
 ChapterStatus = NodeStatus
 
 
-# ==================== 项目服务 ====================
+# ★ v2.0 角色与阵营数据类
+@dataclass
+class Character:
+    """角色数据模型"""
+    char_id: str
+    name: str
+    gender: str = ""
+    birthday: str = ""
+    age: str = ""
+    bio: str = ""
+    camp_ids: list[str] = field(default_factory=list)
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
+class Camp:
+    """阵营数据模型"""
+    camp_id: str
+    name: str
+    description: str = ""
+    created_at: str = ""
+
+
+# ★ v2.0 伏笔数据类
+@dataclass
+class Foreshadow:
+    """伏笔条目"""
+    foreshadow_id: str
+    content: str
+    hidden: bool = False
+    created_at: str = ""
+    order: int = 0
+
+
+# ═══════════════════════════════════════════════════
+# ★ v2.0 CharacterService
+# ═══════════════════════════════════════════════════
+
+class CharacterService:
+    """角色与阵营管理服务"""
+
+    ID = "CharacterService"
+
+    def __init__(self, project_dir: str, event_bus=None, logger=None):
+        self._project_dir = Path(project_dir)
+        self._event_bus = event_bus
+        self._logger = logger
+        self._chars_dir = self._project_dir / "characters"
+        self._camps_file = self._project_dir / "camps" / "index.json"
+        self._index_file = self._chars_dir / "index.json"
+
+    # ── 内部辅助 ──
+    def _log(self, msg: str, level: str = "INFO"):
+        if self._logger:
+            self._logger.log(msg, self.ID, level)
+
+    def _publish(self, name: str, data: dict):
+        if self._event_bus:
+            self._event_bus.publish(name, data, self.ID)
+
+    def _read_json(self, path: Path) -> dict | list:
+        if not path.exists():
+            return {} if path.suffix == ".json" else []
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _write_json(self, path: Path, data):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _now(self) -> str:
+        return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    # ── 角色 CRUD ──
+    def list_characters(self) -> list[Character]:
+        """列出所有角色（bio 按需延迟加载）"""
+        index = self._read_json(self._index_file)
+        if not isinstance(index, list):
+            # 兼容旧格式或损坏 → 重建
+            index = self._rebuild_character_index()
+        result = []
+        for entry in index:
+            c = Character(
+                char_id=entry.get("char_id", ""),
+                name=entry.get("name", ""),
+                gender=entry.get("gender", ""),
+                camp_ids=entry.get("camp_ids", []),
+                created_at=entry.get("created_at", ""),
+                updated_at=entry.get("updated_at", ""),
+            )
+            # 延迟加载 data.json 中的 birthday/age
+            data_file = self._chars_dir / c.char_id / "data.json"
+            data = self._read_json(data_file)
+            if isinstance(data, dict):
+                c.birthday = data.get("birthday", "")
+                c.age = data.get("age", "")
+            result.append(c)
+        return result
+
+    def get_character(self, char_id: str) -> Optional[Character]:
+        """获取完整角色信息（含 bio）"""
+        data_file = self._chars_dir / char_id / "data.json"
+        profile_file = self._chars_dir / char_id / "profile.md"
+        if not data_file.exists():
+            return None
+
+        data = self._read_json(data_file)
+        if not isinstance(data, dict):
+            return None
+
+        # 从 index 获取 name（或从 data 获取）
+        index = self._read_json(self._index_file)
+        name = ""
+        camp_ids = []
+        for entry in (index if isinstance(index, list) else []):
+            if entry.get("char_id") == char_id:
+                name = entry.get("name", "")
+                camp_ids = entry.get("camp_ids", [])
+                break
+
+        c = Character(
+            char_id=char_id,
+            name=name or data.get("name", ""),
+            gender=data.get("gender", ""),
+            birthday=data.get("birthday", ""),
+            age=data.get("age", ""),
+            camp_ids=camp_ids,
+            created_at=data.get("created_at", ""),
+            updated_at=data.get("updated_at", ""),
+        )
+        # 加载 bio
+        if profile_file.exists():
+            with open(profile_file, "r", encoding="utf-8") as f:
+                c.bio = f.read()
+        return c
+
+    def create_character(self, name: str) -> Character:
+        """创建新角色"""
+        if not name or not name.strip():
+            raise ValueError("角色名称不能为空")
+
+        char_id = str(uuid.uuid4())
+        now = self._now()
+
+        # 创建目录和文件
+        char_dir = self._chars_dir / char_id
+        char_dir.mkdir(parents=True, exist_ok=True)
+
+        data = {
+            "name": name.strip(),
+            "gender": "",
+            "birthday": "",
+            "age": "",
+            "camp_ids": [],
+            "created_at": now,
+            "updated_at": now,
+        }
+        self._write_json(char_dir / "data.json", data)
+        # 空 bio
+        with open(char_dir / "profile.md", "w", encoding="utf-8") as f:
+            f.write("")
+
+        # 更新 index
+        index = self._read_json(self._index_file)
+        if not isinstance(index, list):
+            index = []
+        index.append({
+            "char_id": char_id,
+            "name": name.strip(),
+            "gender": "",
+            "camp_ids": [],
+            "created_at": now,
+            "updated_at": now,
+        })
+        self._write_json(self._index_file, index)
+
+        self._log(f"创建角色: {name}")
+        self._publish("character:created", {"char_id": char_id, "name": name})
+
+        return Character(
+            char_id=char_id, name=name.strip(),
+            created_at=now, updated_at=now,
+        )
+
+    def update_character(self, char_id: str,
+                         name: str = None,
+                         gender: str = None,
+                         birthday: str = None,
+                         age: str = None,
+                         bio: str = None,
+                         camp_ids: list[str] = None) -> Character:
+        """更新角色字段（None 表示不修改）"""
+        char_dir = self._chars_dir / char_id
+        data_file = char_dir / "data.json"
+        if not data_file.exists():
+            raise ValueError(f"角色不存在: {char_id}")
+
+        now = self._now()
+        data = self._read_json(data_file)
+        if not isinstance(data, dict):
+            data = {}
+
+        # 更新固定字段
+        if name is not None:
+            data["name"] = name.strip()
+        if gender is not None:
+            data["gender"] = gender
+        if birthday is not None:
+            data["birthday"] = birthday
+        if age is not None:
+            data["age"] = age
+        if camp_ids is not None:
+            data["camp_ids"] = camp_ids
+        data["updated_at"] = now
+        self._write_json(data_file, data)
+
+        # 更新 bio (Markdown 文件)
+        if bio is not None:
+            with open(char_dir / "profile.md", "w", encoding="utf-8") as f:
+                f.write(bio)
+
+        # 更新 index
+        index = self._read_json(self._index_file)
+        if isinstance(index, list):
+            for entry in index:
+                if entry.get("char_id") == char_id:
+                    if name is not None:
+                        entry["name"] = name.strip()
+                    if gender is not None:
+                        entry["gender"] = gender
+                    if camp_ids is not None:
+                        entry["camp_ids"] = camp_ids
+                    entry["updated_at"] = now
+                    break
+            self._write_json(self._index_file, index)
+
+        self._log(f"更新角色: {char_id}")
+        self._publish("character:updated", {"char_id": char_id, "name": data.get("name", "")})
+
+        return self.get_character(char_id)
+
+    def delete_character(self, char_id: str) -> None:
+        """删除角色及其所有数据文件"""
+        char_dir = self._chars_dir / char_id
+        if not char_dir.exists():
+            raise ValueError(f"角色不存在: {char_id}")
+
+        shutil.rmtree(char_dir)
+
+        # 更新 index
+        index = self._read_json(self._index_file)
+        if isinstance(index, list):
+            index = [e for e in index if e.get("char_id") != char_id]
+            self._write_json(self._index_file, index)
+
+        self._log(f"删除角色: {char_id}")
+        self._publish("character:deleted", {"char_id": char_id})
+
+    # ── 角色查询 ──
+    def get_characters_by_camp(self, camp_id: str) -> list[Character]:
+        """获取属于指定阵营的所有角色"""
+        all_chars = self.list_characters()
+        return [c for c in all_chars if camp_id in c.camp_ids]
+
+    def search_characters(self, keyword: str) -> list[Character]:
+        """按名称搜索角色"""
+        all_chars = self.list_characters()
+        kw = keyword.lower()
+        return [c for c in all_chars if kw in c.name.lower()]
+
+    # ── 阵营 CRUD ──
+    def list_camps(self) -> list[Camp]:
+        """列出所有阵营"""
+        data = self._read_json(self._camps_file)
+        if not isinstance(data, list):
+            return []
+        return [
+            Camp(
+                camp_id=e.get("camp_id", ""),
+                name=e.get("name", ""),
+                description=e.get("description", ""),
+                created_at=e.get("created_at", ""),
+            )
+            for e in data
+        ]
+
+    def get_camp(self, camp_id: str) -> Optional[Camp]:
+        for c in self.list_camps():
+            if c.camp_id == camp_id:
+                return c
+        return None
+
+    def create_camp(self, name: str, description: str = "") -> Camp:
+        """创建新阵营"""
+        if not name or not name.strip():
+            raise ValueError("阵营名称不能为空")
+
+        camp_id = str(uuid.uuid4())
+        now = self._now()
+        camps = self._read_json(self._camps_file)
+        if not isinstance(camps, list):
+            camps = []
+        camps.append({
+            "camp_id": camp_id, "name": name.strip(),
+            "description": description, "created_at": now,
+        })
+        self._write_json(self._camps_file, camps)
+
+        self._log(f"创建阵营: {name}")
+        self._publish("camp:created", {"camp_id": camp_id, "name": name})
+        return Camp(camp_id=camp_id, name=name.strip(), description=description, created_at=now)
+
+    def update_camp(self, camp_id: str, name: str = None, description: str = None) -> Camp:
+        """更新阵营信息"""
+        camps = self._read_json(self._camps_file)
+        if not isinstance(camps, list):
+            raise ValueError(f"阵营不存在: {camp_id}")
+        for c in camps:
+            if c.get("camp_id") == camp_id:
+                if name is not None:
+                    c["name"] = name.strip()
+                if description is not None:
+                    c["description"] = description
+                self._write_json(self._camps_file, camps)
+                self._log(f"更新阵营: {camp_id}")
+                self._publish("camp:updated", {"camp_id": camp_id, "name": c.get("name", "")})
+                return self.get_camp(camp_id)
+        raise ValueError(f"阵营不存在: {camp_id}")
+
+    def delete_camp(self, camp_id: str) -> None:
+        """删除阵营，并清理所有关联角色的 camp_ids"""
+        camps = self._read_json(self._camps_file)
+        if not isinstance(camps, list):
+            return
+        camps = [c for c in camps if c.get("camp_id") != camp_id]
+        self._write_json(self._camps_file, camps)
+
+        # 清理所有角色的 camp_ids 引用
+        for char in self.list_characters():
+            if camp_id in char.camp_ids:
+                new_camp_ids = [cid for cid in char.camp_ids if cid != camp_id]
+                self.update_character(char.char_id, camp_ids=new_camp_ids)
+
+        self._log(f"删除阵营: {camp_id}")
+        self._publish("camp:deleted", {"camp_id": camp_id})
+
+    # ── AI 上下文 ──
+    def get_ai_context(self) -> str:
+        """获取所有角色和阵营摘要，供 AI 对话上下文使用"""
+        parts = []
+        camps = self.list_camps()
+        if camps:
+            parts.append("【阵营列表】")
+            for c in camps:
+                parts.append(f"- {c.name}" + (f": {c.description}" if c.description else ""))
+
+        chars = self.list_characters()
+        if chars:
+            parts.append("\n【角色列表】")
+            for c in chars:
+                info_parts = [c.name]
+                if c.gender:
+                    info_parts.append(c.gender)
+                if c.age:
+                    info_parts.append(f"{c.age}岁")
+                cam_names = []
+                for cid in c.camp_ids:
+                    camp = self.get_camp(cid)
+                    if camp:
+                        cam_names.append(camp.name)
+                if cam_names:
+                    info_parts.append(f"所属: {', '.join(cam_names)}")
+                parts.append(f"- {' | '.join(info_parts)}")
+        return "\n".join(parts) if parts else ""
+
+    # ── 索引重建 ──
+    def _rebuild_character_index(self) -> list[dict]:
+        """从 characters/ 目录重建 index.json"""
+        index = []
+        if self._chars_dir.exists():
+            for char_dir in sorted(self._chars_dir.iterdir()):
+                if char_dir.is_dir():
+                    data_file = char_dir / "data.json"
+                    if data_file.exists():
+                        data = self._read_json(data_file)
+                        if isinstance(data, dict):
+                            index.append({
+                                "char_id": char_dir.name,
+                                "name": data.get("name", ""),
+                                "gender": data.get("gender", ""),
+                                "camp_ids": data.get("camp_ids", []),
+                                "created_at": data.get("created_at", ""),
+                                "updated_at": data.get("updated_at", ""),
+                            })
+        if index:
+            self._write_json(self._index_file, index)
+        return index
+
+
+# ═══════════════════════════════════════════════════
+# ★ v2.0 ForeshadowService
+# ═══════════════════════════════════════════════════
+
+class ForeshadowService:
+    """伏笔管理服务"""
+
+    ID = "ForeshadowService"
+
+    def __init__(self, project_dir: str, event_bus=None, logger=None):
+        self._project_dir = Path(project_dir)
+        self._event_bus = event_bus
+        self._logger = logger
+        self._data_file = self._project_dir / "foreshadowing.json"
+
+    def _log(self, msg: str, level: str = "INFO"):
+        if self._logger:
+            self._logger.log(msg, self.ID, level)
+
+    def _publish(self, name: str, data: dict):
+        if self._event_bus:
+            self._event_bus.publish(name, data, self.ID)
+
+    def _read(self) -> list[dict]:
+        if not self._data_file.exists():
+            return []
+        with open(self._data_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _write(self, data: list[dict]):
+        self._data_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._data_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _now(self) -> str:
+        return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    # ── 伏笔 CRUD ──
+    def list_foreshadows(self, include_hidden: bool = False) -> list[Foreshadow]:
+        """列出伏笔条目"""
+        raw = self._read()
+        result = []
+        for entry in raw:
+            f = Foreshadow(
+                foreshadow_id=entry.get("foreshadow_id", ""),
+                content=entry.get("content", ""),
+                hidden=entry.get("hidden", False),
+                created_at=entry.get("created_at", ""),
+                order=entry.get("order", 0),
+            )
+            if include_hidden or not f.hidden:
+                result.append(f)
+        # 按 order 排序
+        result.sort(key=lambda x: x.order)
+        return result
+
+    def get_foreshadow(self, foreshadow_id: str) -> Optional[Foreshadow]:
+        """获取单条伏笔"""
+        raw = self._read()
+        for entry in raw:
+            if entry.get("foreshadow_id") == foreshadow_id:
+                return Foreshadow(
+                    foreshadow_id=entry.get("foreshadow_id", ""),
+                    content=entry.get("content", ""),
+                    hidden=entry.get("hidden", False),
+                    created_at=entry.get("created_at", ""),
+                    order=entry.get("order", 0),
+                )
+        return None
+
+    def add_foreshadow(self, content: str) -> Foreshadow:
+        """添加新伏笔条目"""
+        if not content or not content.strip():
+            raise ValueError("伏笔内容不能为空")
+
+        raw = self._read()
+        foreshadow_id = str(uuid.uuid4())
+        now = self._now()
+        max_order = max((e.get("order", 0) for e in raw), default=-1)
+        entry = {
+            "foreshadow_id": foreshadow_id,
+            "content": content.strip(),
+            "hidden": False,
+            "created_at": now,
+            "order": max_order + 1,
+        }
+        raw.append(entry)
+        self._write(raw)
+
+        self._log(f"添加伏笔: {foreshadow_id}")
+        self._publish("foreshadow:created", {"foreshadow_id": foreshadow_id})
+
+        return Foreshadow(
+            foreshadow_id=foreshadow_id, content=content.strip(),
+            hidden=False, created_at=now, order=max_order + 1,
+        )
+
+    def update_foreshadow(self, foreshadow_id: str, content: str = None) -> Foreshadow:
+        """更新伏笔内容"""
+        raw = self._read()
+        for entry in raw:
+            if entry.get("foreshadow_id") == foreshadow_id:
+                if content is not None:
+                    entry["content"] = content.strip()
+                self._write(raw)
+                self._log(f"更新伏笔: {foreshadow_id}")
+                self._publish("foreshadow:updated", {"foreshadow_id": foreshadow_id})
+                return self.get_foreshadow(foreshadow_id)
+        raise ValueError(f"伏笔不存在: {foreshadow_id}")
+
+    def delete_foreshadow(self, foreshadow_id: str) -> None:
+        """删除伏笔条目"""
+        raw = self._read()
+        new_raw = [e for e in raw if e.get("foreshadow_id") != foreshadow_id]
+        if len(new_raw) == len(raw):
+            raise ValueError(f"伏笔不存在: {foreshadow_id}")
+        # 重整 order
+        for i, entry in enumerate(new_raw):
+            entry["order"] = i
+        self._write(new_raw)
+
+        self._log(f"删除伏笔: {foreshadow_id}")
+        self._publish("foreshadow:deleted", {"foreshadow_id": foreshadow_id})
+
+    def toggle_hidden(self, foreshadow_id: str) -> Foreshadow:
+        """切换伏笔的 hidden 状态"""
+        f = self.get_foreshadow(foreshadow_id)
+        if f is None:
+            raise ValueError(f"伏笔不存在: {foreshadow_id}")
+        return self.set_hidden(foreshadow_id, not f.hidden)
+
+    def set_hidden(self, foreshadow_id: str, hidden: bool) -> Foreshadow:
+        """设置伏笔隐藏状态"""
+        raw = self._read()
+        for entry in raw:
+            if entry.get("foreshadow_id") == foreshadow_id:
+                entry["hidden"] = hidden
+                self._write(raw)
+                self._log(f"伏笔 {'隐藏' if hidden else '显示'}: {foreshadow_id}")
+                self._publish("foreshadow:toggled", {"foreshadow_id": foreshadow_id, "hidden": hidden})
+                return self.get_foreshadow(foreshadow_id)
+        raise ValueError(f"伏笔不存在: {foreshadow_id}")
+
+    # ── AI 上下文 ──
+    def get_ai_context(self) -> str:
+        """获取所有未隐藏伏笔的格式化文本"""
+        items = self.list_foreshadows(include_hidden=False)
+        if not items:
+            return ""
+        lines = ["【当前伏笔线索】"]
+        for i, f in enumerate(items, 1):
+            lines.append(f"{i}. {f.content}")
+        return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════
+# ProjectService（主服务，v1.0 核心 + v2.0 集成）
+# ═══════════════════════════════════════════════════
 
 class ProjectService:
     """项目与设定服务"""
 
-    # 创作流程步骤名称
-    WORKFLOW_STEPS = [
-        "灵感搭建",
-        "基础设定生成",
-        "设定细化",
-        "剧情大纲（全书）",
-        "卷章划分",
-        "单卷细化",
-        "分割单卷内容",
-        "生成内容细纲",
-    ]
+    ID = "ProjectService"
 
-    # 合法项目名字符
-    VALID_NAME_CHARS = set(
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "0123456789_-\u4e00-\u9fff"  # 中英文数字下划线连字符
-    )
-
-    def __init__(self, workspace_dir: str, event_bus: EventBus, logger: Logger):
-        """
-        Args:
-            workspace_dir: 工作区根目录
-            event_bus: 事件总线
-            logger: 日志系统
-        """
-        self.ID = "ProjectService"
+    def __init__(self, workspace_dir: str, event_bus=None, logger=None):
         self._workspace_dir = Path(workspace_dir)
-        self._projects_dir = self._workspace_dir / "projects"
-        self._projects_dir.mkdir(parents=True, exist_ok=True)
         self._event_bus = event_bus
         self._logger = logger
-        self._current_project: Optional[str] = None
+        self._current_project: str | None = None
 
-    # ==================== 项目管理 ====================
+        # ★ v2.0 子服务（懒加载）
+        self._character_service: Optional[CharacterService] = None
+        self._foreshadow_service: Optional[ForeshadowService] = None
+
+    @property
+    def character_service(self) -> CharacterService:
+        """★ v2.0: 懒加载 CharacterService"""
+        if self._character_service is None:
+            project_dir = self._get_project_dir()
+            self._character_service = CharacterService(
+                str(project_dir) if project_dir else str(self._workspace_dir),
+                self._event_bus, self._logger,
+            )
+        return self._character_service
+
+    @property
+    def foreshadow_service(self) -> ForeshadowService:
+        """★ v2.0: 懒加载 ForeshadowService"""
+        if self._foreshadow_service is None:
+            project_dir = self._get_project_dir()
+            self._foreshadow_service = ForeshadowService(
+                str(project_dir) if project_dir else str(self._workspace_dir),
+                self._event_bus, self._logger,
+            )
+        return self._foreshadow_service
+
+    @property
+    def _projects_dir(self) -> Path:
+        return self._workspace_dir / "projects"
+
+    def _get_project_dir(self) -> Optional[Path]:
+        if not self._current_project:
+            return None
+        return self._projects_dir / self._current_project
+
+    def _log(self, msg: str, level: str = "INFO"):
+        if self._logger:
+            self._logger.log(msg, self.ID, level)
+
+    def _publish(self, name: str, data: dict):
+        if self._event_bus:
+            self._event_bus.publish(name, data, self.ID)
+
+    def _read_file(self, path: str) -> str:
+        full = Path(path) if os.path.isabs(path) else (
+            self._get_project_dir() / path if self._get_project_dir() else Path(path)
+        )
+        if not full.exists():
+            return ""
+        with open(full, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def _write_file(self, path: str, content: str):
+        full = Path(path) if os.path.isabs(path) else (
+            self._get_project_dir() / path if self._get_project_dir() else Path(path)
+        )
+        full.parent.mkdir(parents=True, exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def _read_json(self, path: str) -> dict | list:
+        full = Path(path) if os.path.isabs(path) else (
+            self._get_project_dir() / path if self._get_project_dir() else Path(path)
+        )
+        if not full.exists():
+            return {} if full.suffix == ".json" else []
+        with open(full, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _write_json(self, path: str, data):
+        full = Path(path) if os.path.isabs(path) else (
+            self._get_project_dir() / path if self._get_project_dir() else Path(path)
+        )
+        full.parent.mkdir(parents=True, exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _now(self) -> str:
+        return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    # ═══════════════════════════════════════════════
+    # 项目管理 (v1.0)
+    # ═══════════════════════════════════════════════
 
     def list_projects(self) -> list[ProjectMeta]:
         """列出所有项目"""
-        projects = []
         if not self._projects_dir.exists():
-            return projects
-        for item in sorted(self._projects_dir.iterdir()):
-            if item.is_dir():
-                meta = self._load_project_meta(item.name)
-                if meta:
-                    projects.append(meta)
-        return projects
+            return []
+        result = []
+        for d in sorted(self._projects_dir.iterdir()):
+            if d.is_dir():
+                pj = d / "project.json"
+                if pj.exists():
+                    data = self._read_json(str(pj))
+                    if isinstance(data, dict):
+                        result.append(ProjectMeta(
+                            name=d.name,
+                            description=data.get("description", ""),
+                            created_at=data.get("created_at", ""),
+                            updated_at=data.get("updated_at", ""),
+                            current_step=data.get("current_step", 1),
+                        ))
+        return result
 
     def create_project(self, name: str, description: str = "") -> ProjectMeta:
-        """创建新项目"""
-        self._validate_name(name)
-
-        project_dir = self._projects_dir / name
-        if project_dir.exists():
+        """创建项目并自动创建根大纲节点"""
+        if not name or not name.strip():
+            raise ValueError("项目名称不能为空")
+        proj_dir = self._projects_dir / name
+        if proj_dir.exists():
             raise ValueError(f"项目已存在: {name}")
 
-        # 创建目录结构
-        (project_dir / "outline").mkdir(parents=True)
-        (project_dir / "content").mkdir(parents=True)
-        (project_dir / "settings").mkdir(parents=True)
+        now = self._now()
+        proj_dir.mkdir(parents=True, exist_ok=True)
 
-        now = datetime.now().isoformat()
-        meta = ProjectMeta(
-            name=name,
-            description=description,
-            created_at=now,
-            updated_at=now,
-            current_step=1,
+        # project.json
+        self._write_json(str(proj_dir / "project.json"), {
+            "name": name, "description": description,
+            "created_at": now, "updated_at": now, "current_step": 1,
+        })
+
+        # 创建根大纲节点
+        root = OutlineNode(
+            node_id=str(uuid.uuid4()), title=f"{name}·全书大纲",
+            level=OutlineLevel.OUTLINE, parent_id=None,
+            status=NodeStatus.TODO, order=0,
+            created_at=now, updated_at=now,
         )
-        self._save_project_meta(meta)
-        # 初始化空大纲
-        self._save_outline_index(project_dir, {"nodes": {}, "root_id": None})
-
-        # 自动创建根节点
         self._current_project = name
-        self.create_node(None, f"{name}·全书大纲", OutlineLevel.OUTLINE,
-                         content=f"# {name}\n\n## 全书大纲\n\n> 在此编写全书剧情主线、核心冲突、结局走向。")
-        self._current_project = None
-
-        self._logger.log(f"创建项目: {name}", self.ID, "INFO")
-        return meta
+        self._save_outline_node(root)
+        self._log(f"创建项目: {name}")
+        return ProjectMeta(name=name, description=description, created_at=now, updated_at=now)
 
     def delete_project(self, name: str) -> None:
-        """删除项目"""
-        project_dir = self._projects_dir / name
-        if project_dir.exists():
-            shutil.rmtree(project_dir)
-            if self._current_project == name:
-                self._current_project = None
-            self._logger.log(f"删除项目: {name}", self.ID, "INFO")
+        proj_dir = self._projects_dir / name
+        if not proj_dir.exists():
+            raise ValueError(f"项目不存在: {name}")
+        shutil.rmtree(proj_dir)
+        if self._current_project == name:
+            self._current_project = None
+            # ★ v2.0: 重置子服务
+            self._character_service = None
+            self._foreshadow_service = None
+        self._log(f"删除项目: {name}")
 
     def get_current_project(self) -> Optional[str]:
-        """获取当前项目名"""
         return self._current_project
 
     def switch_project(self, name: str) -> None:
-        """切换当前项目"""
-        project_dir = self._projects_dir / name
-        if not project_dir.exists():
+        proj_dir = self._projects_dir / name
+        if not proj_dir.exists():
             raise ValueError(f"项目不存在: {name}")
         self._current_project = name
-        self._event_bus.publish("project:switched", {"project_name": name}, self.ID)
-        self._logger.log(f"切换项目: {name}", self.ID, "INFO")
+        # ★ v2.0: 重置子服务（指向新项目目录）
+        self._character_service = None
+        self._foreshadow_service = None
+        self._publish("project:switched", {"project_name": name})
+        self._log(f"切换项目: {name}")
 
-    # ==================== 大纲层级管理 ====================
+    # ═══════════════════════════════════════════════
+    # 大纲层级管理 (v1.0)
+    # ═══════════════════════════════════════════════
+
+    def _load_outline(self) -> dict:
+        if not self._get_project_dir():
+            return {"nodes": {}, "root_id": None}
+        outline_file = self._get_project_dir() / "outline.json"
+        if not outline_file.exists():
+            return {"nodes": {}, "root_id": None}
+        data = self._read_json(str(outline_file))
+        if not isinstance(data, dict):
+            return {"nodes": {}, "root_id": None}
+        return data
+
+    def _save_outline(self, data: dict):
+        if self._get_project_dir():
+            self._write_json(str(self._get_project_dir() / "outline.json"), data)
+
+    def _save_outline_node(self, node: OutlineNode):
+        """保存节点内容到 outline/ 目录"""
+        proj = self._get_project_dir()
+        if not proj:
+            return
+        outline = self._load_outline()
+        nodes = outline.get("nodes", {})
+        if isinstance(nodes, list):
+            nodes = {n.get("node_id", ""): n for n in nodes}
+
+        # 确定文件名
+        level_names = {1: "outline_L1", 2: "volume", 3: "brief", 4: "chapter", 5: "content"}
+        prefix = level_names.get(node.level.value, "node")
+        filename = f"outline/{prefix}_{node.node_id[:8]}.md"
+
+        # 保存内容
+        self._write_file(filename, node.content)
+
+        # 更新索引
+        nodes[node.node_id] = {
+            "node_id": node.node_id, "title": node.title,
+            "level": node.level.value, "parent_id": node.parent_id,
+            "children_ids": node.children_ids, "status": node.status.value,
+            "order": node.order, "file": filename,
+            "word_count": node.word_count if hasattr(node, 'word_count') else len(node.content),
+            "created_at": node.created_at, "updated_at": node.updated_at,
+        }
+        if outline.get("root_id") is None and node.level == OutlineLevel.OUTLINE:
+            outline["root_id"] = node.node_id
+        outline["nodes"] = nodes
+        self._save_outline(outline)
 
     def get_outline_tree(self) -> list[OutlineNode]:
-        """获取完整大纲树（所有节点列表）"""
-        index = self._load_outline_index()
-        if not index:
-            return []
-        nodes = index.get("nodes", {})
-        return [self._dict_to_node(d) for d in nodes.values()]
+        """获取完整大纲树"""
+        data = self._load_outline()
+        nodes_data = data.get("nodes", {})
+        if isinstance(nodes_data, list):
+            nodes_data = {n.get("node_id", ""): n for n in nodes_data}
+        result = []
+        for nid, nd in nodes_data.items():
+            if not isinstance(nd, dict):
+                continue
+            result.append(OutlineNode(
+                node_id=nid,
+                title=nd.get("title", ""),
+                level=OutlineLevel(nd.get("level", 1)),
+                parent_id=nd.get("parent_id"),
+                children_ids=nd.get("children_ids", []),
+                status=NodeStatus(nd.get("status", "todo")),
+                order=nd.get("order", 0),
+                word_count=nd.get("word_count", 0),
+                created_at=nd.get("created_at", ""),
+                updated_at=nd.get("updated_at", ""),
+            ))
+        return result
 
     def get_node(self, node_id: str) -> Optional[OutlineNode]:
-        """获取单个节点"""
-        index = self._load_outline_index()
-        if not index:
-            return None
-        data = index.get("nodes", {}).get(node_id)
-        return self._dict_to_node(data) if data else None
+        for n in self.get_outline_tree():
+            if n.node_id == node_id:
+                # 加载内容
+                data = self._load_outline()
+                nodes = data.get("nodes", {})
+                if isinstance(nodes, list):
+                    nodes = {nd.get("node_id", ""): nd for nd in nodes}
+                nd = nodes.get(node_id, {})
+                if isinstance(nd, dict) and nd.get("file"):
+                    n.content = self._read_file(nd["file"])
+                return n
+        return None
 
     def get_children(self, parent_id: str) -> list[OutlineNode]:
-        """获取某节点的直接子节点"""
         parent = self.get_node(parent_id)
-        if not parent:
+        if parent is None:
             return []
-        children = []
-        for cid in parent.children_ids:
-            child = self.get_node(cid)
-            if child:
-                children.append(child)
-        return sorted(children, key=lambda n: n.order)
+        return [n for n in self.get_outline_tree() if n.node_id in parent.children_ids]
 
-    def create_node(
-        self, parent_id: Optional[str], title: str,
-        level: OutlineLevel, content: str = "", order: int = -1,
-    ) -> OutlineNode:
-        """在指定父节点下创建子节点"""
-        node_id = str(uuid.uuid4())
-        now = datetime.now().isoformat()
-
-        # 生成文件名
-        level_prefixes = {1: "outline_L1", 2: "volume", 3: "brief", 4: "chapter"}
-        prefix = level_prefixes.get(level.value, "node")
-        file_name = f"{prefix}_{node_id[:8]}.md"
-
+    def create_node(self, parent_id: str | None, title: str,
+                    level: OutlineLevel, content: str = "",
+                    order: int = -1) -> OutlineNode:
+        now = self._now()
         node = OutlineNode(
-            node_id=node_id,
-            title=title,
-            level=level,
-            parent_id=parent_id,
-            status=NodeStatus.TODO,
-            order=order if order >= 0 else self._next_order(parent_id),
-            content=content,
-            file=file_name,
-            created_at=now,
-            updated_at=now,
+            node_id=str(uuid.uuid4()), title=title, level=level,
+            parent_id=parent_id, status=NodeStatus.TODO,
+            order=order, content=content,
+            word_count=len(content), created_at=now, updated_at=now,
         )
+        # 确定 order
+        if order < 0 and parent_id:
+            siblings = self.get_children(parent_id)
+            node.order = max((s.order for s in siblings), default=-1) + 1
 
-        # 保存节点内容
-        self._write_node_content(node)
+        # 保存
+        self._save_outline_node(node)
+        # 更新父节点 children_ids
+        if parent_id:
+            outline = self._load_outline()
+            nodes = outline.get("nodes", {})
+            if isinstance(nodes, list):
+                nodes = {n.get("node_id", ""): n for n in nodes}
+            if parent_id in nodes:
+                pnode = nodes[parent_id]
+                if isinstance(pnode, dict):
+                    kids = pnode.get("children_ids", [])
+                    kids.append(node.node_id)
+                    pnode["children_ids"] = kids
+                outline["nodes"] = nodes
+                self._save_outline(outline)
 
-        # 更新大纲索引
-        index = self._load_outline_index()
-        index["nodes"][node_id] = self._node_to_dict(node)
-
-        # 更新父节点的 children_ids
-        if parent_id and parent_id in index["nodes"]:
-            parent = index["nodes"][parent_id]
-            parent.setdefault("children_ids", []).append(node_id)
-
-        # 如果是第一个节点（无 parent 且 root 为空），设为根
-        if parent_id is None and index.get("root_id") is None:
-            index["root_id"] = node_id
-
-        self._save_outline_index(self._project_dir(), index)
-        self._event_bus.publish("outline:tree_changed", {"project": self._current_project}, self.ID)
-        self._logger.log(f"创建大纲节点: {title} (L{level.value})", self.ID, "INFO")
+        self._publish("outline:tree_changed", {"project_name": self._current_project})
         return node
 
-    def update_node(
-        self, node_id: str, title: Optional[str] = None,
-        content: Optional[str] = None, status: Optional[NodeStatus] = None,
-    ) -> Optional[OutlineNode]:
-        """更新节点"""
-        node = self.get_node(node_id)
-        if node is None:
-            return None
+    def update_node(self, node_id: str, title: str = None,
+                    content: str = None, status: NodeStatus = None) -> OutlineNode:
+        outline = self._load_outline()
+        nodes = outline.get("nodes", {})
+        if isinstance(nodes, list):
+            nodes = {n.get("node_id", ""): n for n in nodes}
+        if node_id not in nodes:
+            raise ValueError(f"节点不存在: {node_id}")
 
+        nd = nodes[node_id]
+        now = self._now()
         if title is not None:
-            node.title = title
-        if content is not None:
-            node.content = content
-            node.word_count = len(content.replace(" ", "").replace("\n", ""))
+            nd["title"] = title
         if status is not None:
-            node.status = status
+            nd["status"] = status.value
+        nd["updated_at"] = now
+        if content is not None:
+            nd["word_count"] = len(content)
+            # 写入内容文件
+            if nd.get("file"):
+                self._write_file(nd["file"], content)
 
-        node.updated_at = datetime.now().isoformat()
-        self._write_node_content(node)
-        self._update_index_node(node)
-
-        self._event_bus.publish("outline:tree_changed", {"project": self._current_project}, self.ID)
-        return node
+        outline["nodes"] = nodes
+        self._save_outline(outline)
+        self._publish("chapter:saved", {"node_id": node_id})
+        return self.get_node(node_id)
 
     def delete_node(self, node_id: str) -> None:
-        """删除节点及其所有子节点"""
-        node = self.get_node(node_id)
-        if node is None:
+        outline = self._load_outline()
+        nodes = outline.get("nodes", {})
+        if isinstance(nodes, list):
+            nodes = {n.get("node_id", ""): n for n in nodes}
+        if node_id not in nodes:
             return
 
         # 递归删除子节点
-        for child_id in list(node.children_ids):
-            self.delete_node(child_id)
+        def _collect_ids(nid):
+            nd = nodes.get(nid, {})
+            ids = [nid]
+            for cid in nd.get("children_ids", []):
+                ids.extend(_collect_ids(cid))
+            return ids
+
+        all_ids = _collect_ids(node_id)
 
         # 从父节点移除
-        if node.parent_id:
-            parent = self.get_node(node.parent_id)
-            if parent:
-                parent.children_ids = [c for c in parent.children_ids if c != node_id]
-                self._update_index_node(parent)
+        nd = nodes.get(node_id, {})
+        pid = nd.get("parent_id")
+        if pid and pid in nodes:
+            pnode = nodes[pid]
+            if isinstance(pnode, dict):
+                pnode["children_ids"] = [
+                    c for c in pnode.get("children_ids", []) if c not in all_ids
+                ]
 
-        # 删除文件
-        self._delete_node_file(node)
+        # 删除节点
+        for nid in all_ids:
+            # 删除内容文件
+            nd_info = nodes.get(nid, {})
+            if isinstance(nd_info, dict) and nd_info.get("file"):
+                fp = self._get_project_dir() / nd_info["file"] if self._get_project_dir() else None
+                if fp and fp.exists():
+                    fp.unlink()
+            nodes.pop(nid, None)
 
-        # 从索引移除
-        index = self._load_outline_index()
-        index["nodes"].pop(node_id, None)
-        if index.get("root_id") == node_id:
-            index["root_id"] = None
-        self._save_outline_index(self._project_dir(), index)
+        outline["nodes"] = nodes
+        self._save_outline(outline)
+        self._publish("outline:tree_changed", {"project_name": self._current_project})
+        self._log(f"删除节点: {node_id}")
 
-        self._event_bus.publish("outline:tree_changed", {"project": self._current_project}, self.ID)
-        self._logger.log(f"删除大纲节点: {node.title}", self.ID, "INFO")
-
-    # ==================== 节点操作 ====================
-
-    def move_node(self, node_id: str, new_parent_id: Optional[str], new_order: int) -> None:
-        """移动节点到新的父节点下（支持升级/降级）"""
-        node = self.get_node(node_id)
-        if node is None:
+    def move_node(self, node_id: str, new_parent_id: str | None, new_order: int) -> None:
+        outline = self._load_outline()
+        nodes = outline.get("nodes", {})
+        if isinstance(nodes, list):
+            nodes = {n.get("node_id", ""): n for n in nodes}
+        if node_id not in nodes:
             raise ValueError(f"节点不存在: {node_id}")
 
-        old_parent_id = node.parent_id
-
+        nd = nodes[node_id]
+        old_pid = nd.get("parent_id")
         # 从旧父节点移除
-        if old_parent_id:
-            old_parent = self.get_node(old_parent_id)
-            if old_parent:
-                old_parent.children_ids = [c for c in old_parent.children_ids if c != node_id]
-                self._update_index_node(old_parent)
-
+        if old_pid and old_pid in nodes:
+            old_parent = nodes[old_pid]
+            if isinstance(old_parent, dict):
+                old_parent["children_ids"] = [
+                    c for c in old_parent.get("children_ids", []) if c != node_id
+                ]
         # 设置新父节点
-        node.parent_id = new_parent_id
-        if new_parent_id:
-            new_parent = self.get_node(new_parent_id)
-            if new_parent:
-                new_parent.children_ids.insert(
-                    max(0, min(new_order, len(new_parent.children_ids))),
-                    node_id,
-                )
-                self._update_index_node(new_parent)
+        nd["parent_id"] = new_parent_id
+        nd["order"] = new_order
+        if new_parent_id and new_parent_id in nodes:
+            new_parent = nodes[new_parent_id]
+            if isinstance(new_parent, dict):
+                kids = new_parent.get("children_ids", [])
+                if node_id not in kids:
+                    kids.append(node_id)
+                new_parent["children_ids"] = kids
 
-        # 更新节点本身
-        self._update_index_node(node)
-        self._event_bus.publish("outline:tree_changed", {"project": self._current_project}, self.ID)
+        outline["nodes"] = nodes
+        self._save_outline(outline)
+        self._publish("outline:tree_changed", {"project_name": self._current_project})
 
     def reorder_siblings(self, parent_id: str, ordered_ids: list[str]) -> None:
-        """重排同级节点顺序"""
-        parent = self.get_node(parent_id)
-        if parent is None:
-            raise ValueError(f"父节点不存在: {parent_id}")
-
-        # 验证所有 ID 都是该父节点的子节点
-        current_ids = set(parent.children_ids)
-        if set(ordered_ids) != current_ids:
-            raise ValueError("排序 ID 列表与当前子节点不匹配")
-
-        parent.children_ids = ordered_ids
-        # 同时更新每个子节点的 order 字段（get_children 按 order 排序）
-        for i, cid in enumerate(ordered_ids):
-            child = self.get_node(cid)
-            if child:
-                child.order = i
-                self._update_index_node(child)
-        self._update_index_node(parent)
-        self._event_bus.publish("outline:tree_changed", {"project": self._current_project}, self.ID)
+        outline = self._load_outline()
+        nodes = outline.get("nodes", {})
+        if isinstance(nodes, list):
+            nodes = {n.get("node_id", ""): n for n in nodes}
+        if parent_id in nodes:
+            pnode = nodes[parent_id]
+            if isinstance(pnode, dict):
+                pnode["children_ids"] = ordered_ids
+        for i, nid in enumerate(ordered_ids):
+            if nid in nodes:
+                nodes[nid]["order"] = i
+        outline["nodes"] = nodes
+        self._save_outline(outline)
+        self._publish("outline:tree_changed", {"project_name": self._current_project})
 
     def split_node(self, node_id: str, split_titles: list[str]) -> list[OutlineNode]:
-        """将节点拆分为多个子节点"""
         node = self.get_node(node_id)
         if node is None:
             raise ValueError(f"节点不存在: {node_id}")
-        if node.level.value >= OutlineLevel.CONTENT.value:
+        if node.level.value >= 5:
             raise ValueError("正文节点不允许拆分")
-
         new_level = OutlineLevel(node.level.value + 1)
-        new_nodes = []
-        for i, title in enumerate(split_titles):
-            child = self.create_node(node_id, title, new_level, order=i)
-            new_nodes.append(child)
-
-        self._logger.log(f"拆分节点 [{node.title}] → {len(new_nodes)} 个子节点", self.ID, "INFO")
-        return new_nodes
+        result = []
+        for title in split_titles:
+            child = self.create_node(node_id, title, new_level)
+            result.append(child)
+        return result
 
     def merge_nodes(self, child_ids: list[str], new_title: str) -> OutlineNode:
-        """将多个同级子节点合并为一个"""
-        if len(child_ids) < 2:
-            raise ValueError("至少需要 2 个节点进行合并")
-
+        if not child_ids:
+            raise ValueError("child_ids 不能为空")
         first = self.get_node(child_ids[0])
         if first is None:
             raise ValueError("节点不存在")
-
         parent_id = first.parent_id
         for cid in child_ids[1:]:
             n = self.get_node(cid)
-            if n is None or n.parent_id != parent_id:
+            if n is None:
+                raise ValueError(f"节点不存在: {cid}")
+            if n.parent_id != parent_id:
                 raise ValueError("只能合并同父节点的兄弟节点")
-
         merged = self.create_node(parent_id, new_title, first.level)
-        # 将原节点作为子节点挂载（保留内容）
         for cid in child_ids:
             self.move_node(cid, merged.node_id, -1)
-
-        self._logger.log(f"合并 {len(child_ids)} 个节点 → {new_title}", self.ID, "INFO")
         return merged
 
-    # ==================== 快捷查询 ====================
-
     def get_nodes_by_level(self, level: OutlineLevel) -> list[OutlineNode]:
-        """获取指定层级的所有节点"""
         return [n for n in self.get_outline_tree() if n.level == level]
 
     def get_full_path(self, node_id: str) -> list[OutlineNode]:
-        """获取从根到该节点的完整路径"""
-        path = []
-        current = self.get_node(node_id)
-        while current:
-            path.insert(0, current)
-            if current.parent_id:
-                current = self.get_node(current.parent_id)
-            else:
+        result = []
+        nid = node_id
+        while nid:
+            node = self.get_node(nid)
+            if node is None:
                 break
-        return path
-
-    # ==================== 流程状态 ====================
+            result.insert(0, node)
+            nid = node.parent_id
+        return result
 
     def get_workflow_step(self) -> int:
-        """获取当前创作流程步骤"""
-        meta = self._load_project_meta(self._current_project or "")
-        return meta.current_step if meta else 1
+        if self._get_project_dir():
+            pj = self._read_json(str(self._get_project_dir() / "project.json"))
+            if isinstance(pj, dict):
+                return pj.get("current_step", 1)
+        return 1
 
     def set_workflow_step(self, step: int) -> None:
-        """设置当前创作流程步骤"""
-        if not 1 <= step <= 8:
-            raise ValueError(f"步骤值必须在 1~8 之间，当前: {step}")
-        meta = self._load_project_meta(self._current_project or "")
-        if meta:
-            meta.current_step = step
-            meta.updated_at = datetime.now().isoformat()
-            self._save_project_meta(meta)
-            self._event_bus.publish("workflow:step_changed", {"step": step}, self.ID)
+        if self._get_project_dir():
+            pj = self._read_json(str(self._get_project_dir() / "project.json"))
+            if isinstance(pj, dict):
+                pj["current_step"] = step
+                self._write_json(str(self._get_project_dir() / "project.json"), pj)
 
-    # ==================== 正文（L5）快捷接口 ====================
-
+    # 正文 L5 快捷接口
     def list_chapters(self) -> list[OutlineNode]:
-        """获取所有 L5 正文节点"""
         return self.get_nodes_by_level(OutlineLevel.CONTENT)
 
     def get_chapter(self, chapter_id: str) -> Optional[OutlineNode]:
@@ -463,139 +1123,194 @@ class ProjectService:
     def create_chapter(self, parent_id: str, title: str, content: str = "") -> OutlineNode:
         return self.create_node(parent_id, title, OutlineLevel.CONTENT, content)
 
-    def update_chapter(self, chapter_id: str, **kwargs) -> Optional[OutlineNode]:
-        return self.update_node(
-            chapter_id,
-            title=kwargs.get("title"),
-            content=kwargs.get("content"),
-            status=kwargs.get("status"),
-        )
+    def update_chapter(self, chapter_id: str, **kwargs) -> OutlineNode:
+        return self.update_node(chapter_id, **kwargs)
 
     def delete_chapter(self, chapter_id: str) -> None:
         self.delete_node(chapter_id)
 
-    # ==================== 通用设定管理（自由分类） ====================
+    # ═══════════════════════════════════════════════
+    # 通用自由分类设定管理 (v1.0)
+    # ═══════════════════════════════════════════════
+
+    @property
+    def _settings_dir(self) -> Optional[Path]:
+        if not self._get_project_dir():
+            return None
+        return self._get_project_dir() / "settings"
 
     def list_categories(self) -> list[str]:
-        """列出当前项目下所有设定分类（按自定义顺序，或字母排序）"""
-        settings_dir = self._project_dir() / "settings"
-        if not settings_dir.exists():
+        sd = self._settings_dir
+        if not sd or not sd.exists():
             return []
-        items = sorted([d.name for d in settings_dir.iterdir() if d.is_dir()])
-        return self._load_order(settings_dir, items)
+        order_file = sd / "_order.json"
+        order_data = self._read_json(str(order_file)) if order_file.exists() else []
+        if isinstance(order_data, list) and order_data:
+            ordered = [d for d in order_data if (sd / d).is_dir()]
+            remaining = [d.name for d in sorted(sd.iterdir()) if d.is_dir() and d.name not in ordered and d.name != "_order"]
+            return ordered + remaining
+        return sorted([d.name for d in sd.iterdir() if d.is_dir()])
 
     def list_docs(self, category: str) -> list[str]:
-        """列出指定分类下的所有设定文档（按自定义顺序，或字母排序）"""
-        cat_dir = self._project_dir() / "settings" / category
+        sd = self._settings_dir
+        if not sd:
+            return []
+        cat_dir = sd / category
         if not cat_dir.exists():
             return []
-        items = sorted([f.stem for f in cat_dir.glob("*.md")])
-        return self._load_order(cat_dir, items)
+        order_file = cat_dir / "_order.json"
+        order_data = self._read_json(str(order_file)) if order_file.exists() else []
+        if isinstance(order_data, list) and order_data:
+            ordered = [d for d in order_data if (cat_dir / f"{d}.md").exists()]
+            remaining = [f.stem for f in sorted(cat_dir.iterdir()) if f.suffix == ".md" and f.stem not in ordered and f.name != "_order"]
+            return ordered + remaining
+        return sorted([f.stem for f in cat_dir.iterdir() if f.suffix == ".md"])
 
-    def get_setting(self, category: str, doc_name: str) -> Optional[str]:
-        """读取指定分类下的设定文档内容
-        Args:
-            category: 分类名（即目录名），如 "力量体系"
-            doc_name: 文档名（不含 .md），如 "斗气修炼"
-        """
-        file_path = self._project_dir() / "settings" / category / f"{doc_name}.md"
-        if not file_path.exists():
+    def get_setting(self, category: str, name: str) -> Optional[str]:
+        sd = self._settings_dir
+        if not sd:
             return None
-        return file_path.read_text(encoding="utf-8")
+        fp = sd / category / f"{name}.md"
+        if not fp.exists():
+            return None
+        return self._read_file(str(fp))
 
-    def save_setting(self, category: str, doc_name: str, content: str) -> None:
-        """创建或更新设定文档
-        Args:
-            category: 分类名（目录名），不存在则自动创建
-            doc_name: 文档名（不含扩展名）
-            content: Markdown 内容
-        """
-        cat_dir = self._project_dir() / "settings" / category
+    def save_setting(self, category: str, name: str, content: str) -> None:
+        sd = self._settings_dir
+        if not sd:
+            return
+        cat_dir = sd / category
         cat_dir.mkdir(parents=True, exist_ok=True)
-        (cat_dir / f"{doc_name}.md").write_text(content, encoding="utf-8")
-        self._event_bus.publish("setting:updated", {"category": category, "doc": doc_name}, self.ID)
-        self._logger.log(f"保存设定: {category}/{doc_name}", self.ID, "INFO")
+        self._write_file(str(cat_dir / f"{name}.md"), content)
+        self._log(f"设定 {category}/{name} 已保存")
+        self._publish("setting:updated", {"category": category, "name": name})
 
-    def delete_setting(self, category: str, doc_name: str) -> None:
-        """删除设定文档"""
-        file_path = self._project_dir() / "settings" / category / f"{doc_name}.md"
-        if file_path.exists():
-            file_path.unlink()
-            self._logger.log(f"删除设定: {category}/{doc_name}", self.ID, "INFO")
+    def delete_setting(self, category: str, name: str) -> None:
+        sd = self._settings_dir
+        if not sd:
+            return
+        fp = sd / category / f"{name}.md"
+        if fp.exists():
+            fp.unlink()
+            self._log(f"设定 {category}/{name} 已删除")
 
     def delete_category(self, category: str) -> None:
-        """删除整个设定分类目录"""
-        import shutil
-        cat_dir = self._project_dir() / "settings" / category
+        sd = self._settings_dir
+        if not sd:
+            return
+        cat_dir = sd / category
         if cat_dir.exists():
             shutil.rmtree(cat_dir)
-            self._logger.log(f"删除设定分类: {category}", self.ID, "INFO")
-
-    # ---- 设定排序与重命名 ----
-
-    def _get_order_file(self, dir_path: Path) -> Path:
-        return dir_path / "_order.json"
-
-    def _load_order(self, dir_path: Path, current_items: list[str]) -> list[str]:
-        """加载自定义排序列表，合并新项目（如新增的目录/文件）"""
-        order_file = self._get_order_file(dir_path)
-        if not order_file.exists():
-            return current_items
-        try:
-            saved = json.loads(order_file.read_text(encoding="utf-8"))
-        except Exception:
-            return current_items
-        # 合并：保留已排序的项，追加新出现的项
-        result = [s for s in saved if s in current_items]
-        for item in current_items:
-            if item not in result:
-                result.append(item)
-        return result
-
-    def _save_order(self, dir_path: Path, ordered: list[str]) -> None:
-        self._get_order_file(dir_path).write_text(
-            json.dumps(ordered, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def reorder_categories(self, ordered_names: list[str]) -> None:
-        """重排设定分类的显示顺序"""
-        settings_dir = self._project_dir() / "settings"
-        self._save_order(settings_dir, ordered_names)
-        self._logger.log("设定分类顺序已更新", self.ID, "INFO")
-
-    def reorder_docs(self, category: str, ordered_names: list[str]) -> None:
-        """重排指定分类下文档的显示顺序"""
-        cat_dir = self._project_dir() / "settings" / category
-        self._save_order(cat_dir, ordered_names)
-        self._logger.log(f"设定文档顺序已更新: {category}", self.ID, "INFO")
+            self._log(f"分类 {category} 已删除")
 
     def rename_category(self, old_name: str, new_name: str) -> None:
-        """重命名设定分类（目录级 rename）"""
-        old_dir = self._project_dir() / "settings" / old_name
-        new_dir = self._project_dir() / "settings" / new_name
-        if old_dir.exists():
-            old_dir.rename(new_dir)
-            self._logger.log(f"设定分类重命名: {old_name} → {new_name}", self.ID, "INFO")
+        sd = self._settings_dir
+        if not sd:
+            return
+        old = sd / old_name
+        new = sd / new_name
+        if old.exists() and not new.exists():
+            old.rename(new)
 
     def rename_setting(self, category: str, old_name: str, new_name: str) -> None:
-        """重命名设定文档（文件级 rename）"""
-        old_path = self._project_dir() / "settings" / category / f"{old_name}.md"
-        new_path = self._project_dir() / "settings" / category / f"{new_name}.md"
-        if old_path.exists():
-            old_path.rename(new_path)
-            self._logger.log(f"设定文档重命名: {category}/{old_name} → {new_name}", self.ID, "INFO")
+        sd = self._settings_dir
+        if not sd:
+            return
+        old = sd / category / f"{old_name}.md"
+        new = sd / category / f"{new_name}.md"
+        if old.exists() and not new.exists():
+            old.rename(new)
 
-    # ---- 向后兼容别名（废弃，保留不删避免旧测试失败） ----
+    def reorder_categories(self, ordered_names: list[str]) -> None:
+        sd = self._settings_dir
+        if not sd:
+            return
+        self._write_json(str(sd / "_order.json"), ordered_names)
+
+    def reorder_docs(self, category: str, ordered_names: list[str]) -> None:
+        sd = self._settings_dir
+        if not sd:
+            return
+        cat_dir = sd / category
+        cat_dir.mkdir(parents=True, exist_ok=True)
+        self._write_json(str(cat_dir / "_order.json"), ordered_names)
+
+    def search_content(self, keyword: str, category: str | None = None) -> list[dict]:
+        results = []
+        proj = self._get_project_dir()
+        if not proj:
+            return results
+
+        # 搜索设定
+        sd = proj / "settings"
+        if sd.exists():
+            for cat in sd.iterdir():
+                if cat.is_dir() and (category is None or cat.name == category):
+                    for f in cat.iterdir():
+                        if f.suffix == ".md":
+                            content = self._read_file(str(f))
+                            if keyword in content:
+                                results.append({
+                                    "type": "setting",
+                                    "path": f"settings/{cat.name}/{f.name}",
+                                    "snippet": self._extract_snippet(content, keyword),
+                                })
+
+        # 搜索正文
+        cd = proj / "content"
+        if cd.exists() and category is None:
+            for f in cd.iterdir():
+                if f.suffix == ".md":
+                    content = self._read_file(str(f))
+                    if keyword in content:
+                        results.append({
+                            "type": "chapter",
+                            "path": f"content/{f.name}",
+                            "snippet": self._extract_snippet(content, keyword),
+                        })
+        return results
+
+    def _extract_snippet(self, content: str, keyword: str) -> str:
+        lines = content.split("\n")
+        for line in lines:
+            if keyword in line:
+                return line.strip()[:200]
+        return content[:200]
+
+    def export_settings(self, category: str, names: list[str],
+                        output_dir: str, merge: bool = False) -> str:
+        if merge:
+            output_path = Path(output_dir) / f"{category}_export.md"
+            parts = [f"# {category}\n\n> 导出时间: {self._now()}\n"]
+            for name in names:
+                content = self.get_setting(category, name)
+                if content:
+                    parts.append(f"## {name}\n\n{content}\n\n---\n")
+            self._write_file(str(output_path), "\n".join(parts))
+            return str(output_path)
+        else:
+            out_dir = Path(output_dir) / category
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for name in names:
+                content = self.get_setting(category, name)
+                if content:
+                    self._write_file(str(out_dir / f"{name}.md"), content)
+            return str(out_dir)
+
+    # ═══════════════════════════════════════════════
+    # 向后兼容别名 (v1.0)
+    # ═══════════════════════════════════════════════
     def list_power_systems(self) -> list[str]:
-        return self.list_docs("力量体系")
+        return self.list_docs("power_systems")
 
     def get_power_system(self, name: str) -> Optional[str]:
-        return self.get_setting("力量体系", name)
+        return self.get_setting("power_systems", name)
 
     def save_power_system(self, name: str, content: str) -> None:
-        self.save_setting("力量体系", name, content)
+        self.save_setting("power_systems", name, content)
 
     def delete_power_system(self, name: str) -> None:
-        self.delete_setting("力量体系", name)
+        self.delete_setting("power_systems", name)
 
     def list_factions(self) -> list[str]:
         return self.list_categories()
@@ -606,239 +1321,8 @@ class ProjectService:
     def get_character(self, faction: str, name: str) -> Optional[str]:
         return self.get_setting(faction, name)
 
-    def save_character(self, faction: str, name: str, content: str,
-                       cross_factions: Optional[list[str]] = None) -> None:
+    def save_character(self, faction: str, name: str, content: str) -> None:
         self.save_setting(faction, name, content)
-        if cross_factions:
-            for cf in cross_factions:
-                if cf != faction:
-                    self.save_setting(cf, name, content)
 
-    def delete_character(self, faction: str, name: str, remove_cross: bool = True) -> None:
+    def delete_character(self, faction: str, name: str) -> None:
         self.delete_setting(faction, name)
-
-    # ==================== 全局搜索 ====================
-
-    def search_content(self, keyword: str) -> list[dict]:
-        """在当前项目中搜索包含关键词的内容
-        Returns:
-            [{"type": "outline"|"setting"|"content", "path": str, "snippet": str}, ...]
-        """
-        results = []
-        proj_dir = self._project_dir()
-        keyword_lower = keyword.lower()
-        for md_file in proj_dir.rglob("*.md"):
-            try:
-                text = md_file.read_text(encoding="utf-8")
-                if keyword_lower in text.lower():
-                    idx = text.lower().index(keyword_lower)
-                    start = max(0, idx - 40)
-                    end = min(len(text), idx + len(keyword) + 40)
-                    snippet = ("..." if start > 0 else "") + text[start:end] + ("..." if end < len(text) else "")
-                    rel_path = str(md_file.relative_to(proj_dir))
-                    results.append({"path": rel_path, "snippet": snippet})
-            except Exception:
-                pass
-        return results[:20]  # 最多 20 条
-
-    # ==================== 导出 ====================
-
-    def export_settings(
-        self, categories: Optional[list[str]] = None,
-        output_dir: str = "", merge: bool = False,
-    ) -> str:
-        """导出设定为 Markdown 文件
-        Args:
-            categories: 要导出的分类列表，None=全部
-            output_dir: 输出目录
-            merge: True 合并为单文件
-        Returns: 导出文件路径
-        """
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        project = self._current_project or "unknown"
-        cats = categories or self.list_categories()
-
-        if merge:
-            content = f"# {project} 设定导出\n导出时间: {timestamp}\n\n"
-            for cat in cats:
-                content += f"## {cat}\n\n"
-                for doc in self.list_docs(cat):
-                    text = self.get_setting(cat, doc) or ""
-                    content += f"### {doc}\n\n{text}\n\n"
-            file_path = output_path / f"{project}_settings_{timestamp}.md"
-            file_path.write_text(content, encoding="utf-8")
-        else:
-            for cat in cats:
-                cat_out = output_path / cat
-                cat_out.mkdir(exist_ok=True)
-                for doc in self.list_docs(cat):
-                    text = self.get_setting(cat, doc)
-                    if text:
-                        (cat_out / f"{doc}.md").write_text(text, encoding="utf-8")
-            file_path = output_path
-
-        self._logger.log(f"导出设定: {len(cats)} 个分类 → {output_dir}", self.ID, "INFO")
-        return str(file_path)
-
-    # ==================== 内部实现 ====================
-
-    def _project_dir(self) -> Path:
-        """获取当前项目目录"""
-        if not self._current_project:
-            raise ValueError("未选择项目")
-        return self._projects_dir / self._current_project
-
-    def _load_project_meta(self, name: str) -> Optional[ProjectMeta]:
-        """加载项目元数据"""
-        meta_path = self._projects_dir / name / "project.json"
-        if not meta_path.exists():
-            return None
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return ProjectMeta(
-                name=data.get("name", name),
-                description=data.get("description", ""),
-                created_at=data.get("created_at", ""),
-                updated_at=data.get("updated_at", ""),
-                current_step=data.get("current_step", 1),
-            )
-        except (json.JSONDecodeError, KeyError):
-            return None
-
-    def _save_project_meta(self, meta: ProjectMeta) -> None:
-        """保存项目元数据"""
-        meta_path = self._projects_dir / meta.name / "project.json"
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "name": meta.name,
-                "description": meta.description,
-                "created_at": meta.created_at,
-                "updated_at": meta.updated_at,
-                "current_step": meta.current_step,
-            }, f, ensure_ascii=False, indent=2)
-
-    def _load_outline_index(self) -> Optional[dict]:
-        """加载大纲索引"""
-        index_path = self._project_dir() / "outline.json"
-        if not index_path.exists():
-            return {"nodes": {}, "root_id": None}
-        try:
-            with open(index_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            # 尝试重建
-            self._logger.log("outline.json 损坏，尝试重建索引", self.ID, "WARNING")
-            return self._rebuild_outline_index()
-
-    def _save_outline_index(self, project_dir: Path, index: dict) -> None:
-        """保存大纲索引"""
-        index_path = project_dir / "outline.json"
-        with open(index_path, "w", encoding="utf-8") as f:
-            json.dump(index, f, ensure_ascii=False, indent=2)
-
-    def _rebuild_outline_index(self) -> dict:
-        """从 outline/ 目录重建大纲索引"""
-        outline_dir = self._project_dir() / "outline"
-        if not outline_dir.exists():
-            return {"nodes": {}, "root_id": None}
-
-        nodes = {}
-        for md_file in outline_dir.glob("*.md"):
-            content = md_file.read_text(encoding="utf-8")
-            # 简单重建：从文件名推断信息
-            node_id = str(uuid.uuid4())
-            nodes[node_id] = {
-                "node_id": node_id,
-                "title": md_file.stem,
-                "level": 1,
-                "parent_id": None,
-                "children_ids": [],
-                "status": "todo",
-                "order": 0,
-                "content": content,
-                "file": f"outline/{md_file.name}",
-                "word_count": len(content.replace(" ", "").replace("\n", "")),
-                "created_at": "",
-                "updated_at": "",
-            }
-
-        index = {"nodes": nodes, "root_id": None}
-        self._save_outline_index(self._project_dir(), index)
-        return index
-
-    def _write_node_content(self, node: OutlineNode) -> None:
-        """将节点内容写入 .md 文件"""
-        if node.level.value <= 4:  # L1~L4 存 outline/
-            content_dir = self._project_dir() / "outline"
-        else:  # L5 存 content/
-            content_dir = self._project_dir() / "content"
-        content_dir.mkdir(parents=True, exist_ok=True)
-        (content_dir / node.file).write_text(node.content or "", encoding="utf-8")
-
-    def _delete_node_file(self, node: OutlineNode) -> None:
-        """删除节点对应的 .md 文件"""
-        if node.level.value <= 4:
-            file_path = self._project_dir() / "outline" / node.file
-        else:
-            file_path = self._project_dir() / "content" / node.file
-        if file_path.exists():
-            file_path.unlink()
-
-    def _update_index_node(self, node: OutlineNode) -> None:
-        """更新索引中的单个节点"""
-        index = self._load_outline_index()
-        index["nodes"][node.node_id] = self._node_to_dict(node)
-        self._save_outline_index(self._project_dir(), index)
-
-    def _next_order(self, parent_id: Optional[str]) -> int:
-        """获取下一个排序序号"""
-        if parent_id is None:
-            return 0
-        children = self.get_children(parent_id)
-        return children[-1].order + 1 if children else 0
-
-    @staticmethod
-    def _node_to_dict(node: OutlineNode) -> dict:
-        return {
-            "node_id": node.node_id,
-            "title": node.title,
-            "level": node.level.value,
-            "parent_id": node.parent_id,
-            "children_ids": node.children_ids,
-            "status": node.status.value,
-            "order": node.order,
-            "content": node.content,
-            "file": node.file,
-            "word_count": node.word_count,
-            "created_at": node.created_at,
-            "updated_at": node.updated_at,
-        }
-
-    @staticmethod
-    def _dict_to_node(d: dict) -> OutlineNode:
-        return OutlineNode(
-            node_id=d.get("node_id", ""),
-            title=d.get("title", ""),
-            level=OutlineLevel(d.get("level", 1)),
-            parent_id=d.get("parent_id"),
-            children_ids=d.get("children_ids", []),
-            status=NodeStatus(d.get("status", "todo")),
-            order=d.get("order", 0),
-            content=d.get("content", ""),
-            file=d.get("file", ""),
-            word_count=d.get("word_count", 0),
-            created_at=d.get("created_at", ""),
-            updated_at=d.get("updated_at", ""),
-        )
-
-    @staticmethod
-    def _validate_name(name: str) -> None:
-        """校验项目名称"""
-        if not name or not name.strip():
-            raise ValueError("项目名不能为空")
-        # 简化校验：不允许路径分隔符
-        if "/" in name or "\\" in name or ":" in name:
-            raise ValueError("项目名不能包含 / \\ : 等特殊字符")
