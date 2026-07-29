@@ -126,6 +126,7 @@ class CharacterService:
         self._logger = logger
         self._chars_dir = self._project_dir / "characters"
         self._camps_file = self._project_dir / "camps" / "index.json"
+        self._camps_order_file = self._project_dir / "camps" / "_order.json"
         self._index_file = self._chars_dir / "index.json"
 
     # ── 内部辅助 ──
@@ -350,11 +351,11 @@ class CharacterService:
 
     # ── 阵营 CRUD ──
     def list_camps(self) -> list[Camp]:
-        """列出所有阵营"""
+        """列出所有阵营（按 _order.json 排序）"""
         data = self._read_json(self._camps_file)
         if not isinstance(data, list):
             return []
-        return [
+        camps = [
             Camp(
                 camp_id=e.get("camp_id", ""),
                 name=e.get("name", ""),
@@ -363,6 +364,29 @@ class CharacterService:
             )
             for e in data
         ]
+        # 按 _order.json 排序
+        order = self._read_json(self._camps_order_file)
+        if isinstance(order, list):
+            order_map = {cid: i for i, cid in enumerate(order) if isinstance(cid, str)}
+            camps.sort(key=lambda c: order_map.get(c.camp_id, 9999))
+        return camps
+
+    def _save_camps_order(self, ordered_ids: list[str]):
+        """保存阵营显示顺序"""
+        self._write_json(self._camps_order_file, ordered_ids)
+
+    def reorder_camps(self, ordered_ids: list[str]) -> None:
+        """重排阵营显示顺序（传入完整的 camp_id 列表）"""
+        all_camps = self.list_camps()
+        existing_ids = {c.camp_id for c in all_camps}
+        # 确保所有现有阵营都在列表中
+        full_order = [cid for cid in ordered_ids if cid in existing_ids]
+        for c in all_camps:
+            if c.camp_id not in full_order:
+                full_order.append(c.camp_id)
+        self._save_camps_order(full_order)
+        self._log(f"阵营顺序已更新")
+        self._publish("camp:updated", {"camp_id": ""})
 
     def get_camp(self, camp_id: str) -> Optional[Camp]:
         for c in self.list_camps():
@@ -385,6 +409,13 @@ class CharacterService:
             "description": description, "created_at": now,
         })
         self._write_json(self._camps_file, camps)
+
+        # 添加到排序列表末尾
+        order = self._read_json(self._camps_order_file)
+        if not isinstance(order, list):
+            order = []
+        order.append(camp_id)
+        self._write_json(self._camps_order_file, order)
 
         self._log(f"创建阵营: {name}")
         self._publish("camp:created", {"camp_id": camp_id, "name": name})
@@ -414,6 +445,12 @@ class CharacterService:
             return
         camps = [c for c in camps if c.get("camp_id") != camp_id]
         self._write_json(self._camps_file, camps)
+
+        # 从排序列表移除
+        order = self._read_json(self._camps_order_file)
+        if isinstance(order, list):
+            order = [cid for cid in order if cid != camp_id]
+            self._write_json(self._camps_order_file, order)
 
         # 清理所有角色的 camp_ids 引用
         for char in self.list_characters():

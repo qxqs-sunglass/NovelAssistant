@@ -2348,6 +2348,7 @@ class CharacterPanel(BasePanel):
         self._project_service = project_service
         self._current_char_id: str | None = None
         self._bio_dirty = False
+        self._fields_dirty = False
         super().__init__(parent, event_bus, logger)
 
     def _setup_ui(self):
@@ -2439,9 +2440,18 @@ class CharacterPanel(BasePanel):
     def on_show(self):
         self._refresh_character_list()
 
+    def on_close(self):
+        """面板关闭时自动保存"""
+        self._auto_save_if_dirty()
+
     def _auto_save_if_dirty(self):
-        if self._bio_dirty and self._current_char_id:
+        """切换角色或离开面板时自动保存未保存的更改"""
+        if not self._current_char_id:
+            return
+        if self._bio_dirty:
             self._save_bio()
+        if self._fields_dirty:
+            self._save_fields()
 
     # ── 角色列表 ──
     def _refresh_character_list(self):
@@ -2450,6 +2460,14 @@ class CharacterPanel(BasePanel):
             cs = self._project_service.character_service
             keyword = self._search_var.get().strip()
             chars = cs.search_characters(keyword) if keyword else cs.list_characters()
+            # ★ 按第一阵营排序：先获取阵营顺序
+            camps = cs.list_camps()
+            camp_order = {c.camp_id: i for i, c in enumerate(camps)}
+            def _sort_key(ch):
+                if not ch.camp_ids:
+                    return (9999, ch.name)
+                return (camp_order.get(ch.camp_ids[0], 9998), ch.name)
+            chars.sort(key=_sort_key)
             for c in chars:
                 camps_str = ""
                 if c.camp_ids:
@@ -2487,6 +2505,7 @@ class CharacterPanel(BasePanel):
                     self._bio_text.insert("1.0", full.bio)
                     self._bio_text.edit_modified(False)
                     self._bio_dirty = False
+                    self._fields_dirty = False
                     self._refresh_camp_tags()
         except Exception:
             pass
@@ -2534,7 +2553,7 @@ class CharacterPanel(BasePanel):
 
     # ── 固定字段 ──
     def _on_field_changed(self, *args):
-        pass  # 字段编辑不立即保存
+        self._fields_dirty = True
 
     def _save_fields(self):
         if not self._current_char_id:
@@ -2548,6 +2567,7 @@ class CharacterPanel(BasePanel):
                 birthday=self._field_vars["birthday"].get(),
                 age=self._field_vars["age"].get(),
             )
+            self._fields_dirty = False
             self._refresh_character_list()
         except ValueError as e:
             messagebox.showerror("错误", str(e))
@@ -2592,23 +2612,65 @@ class CharacterPanel(BasePanel):
             self._refresh_camp_tags()
 
     def _show_camp_dialog(self):
-        """阵营管理对话框"""
+        """阵营管理对话框 — ★ 支持上下调整顺序"""
         dialog = tk.Toplevel(self.frame)
         dialog.title("管理阵营")
-        dialog.geometry("450x350")
+        dialog.geometry("480x400")
         dialog.transient(self.frame)
         dialog.grab_set()
 
         cs = self._project_service.character_service
 
-        # 列表
-        list_frame = tk.Frame(dialog)
-        list_frame.pack(fill="both", expand=True, padx=8, pady=8)
-        camp_list = tk.Listbox(list_frame, font=("Microsoft YaHei", 10))
+        # 列表区（含排序按钮）
+        list_outer = tk.Frame(dialog)
+        list_outer.pack(fill="both", expand=True, padx=8, pady=8)
+        camp_list = tk.Listbox(list_outer, font=("Microsoft YaHei", 10))
         camp_list.pack(side="left", fill="both", expand=True)
-        sl = tk.Scrollbar(list_frame, orient="vertical", command=camp_list.yview)
-        sl.pack(side="right", fill="y")
+        sl = tk.Scrollbar(list_outer, orient="vertical", command=camp_list.yview)
+        sl.pack(side="left", fill="y")
         camp_list.configure(yscrollcommand=sl.set)
+
+        # ★ 排序按钮
+        order_frame = tk.Frame(list_outer)
+        order_frame.pack(side="left", fill="y", padx=4)
+        tk.Button(order_frame, text="▲", font=("Microsoft YaHei", 10),
+                  width=3, command=lambda: _move_camp(-1)).pack(pady=2)
+        tk.Button(order_frame, text="▼", font=("Microsoft YaHei", 10),
+                  width=3, command=lambda: _move_camp(1)).pack(pady=2)
+
+        def _get_camp_ids_display_order():
+            """获取当前列表框中显示的 camp_id 顺序"""
+            ids = []
+            for i in range(camp_list.size()):
+                text = camp_list.get(i)
+                # text format: "青云宗  — 简介..."
+                name = text.split("  —")[0].strip()
+                for c in cs.list_camps():
+                    if c.name == name:
+                        ids.append(c.camp_id)
+                        break
+            return ids
+
+        def _move_camp(delta: int):
+            """移动选中阵营的显示顺序"""
+            sel = camp_list.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            new_idx = idx + delta
+            if new_idx < 0 or new_idx >= camp_list.size():
+                return
+            # 获取完整顺序ID列表
+            ids = _get_camp_ids_display_order()
+            # 交换
+            ids[idx], ids[new_idx] = ids[new_idx], ids[idx]
+            # 保存
+            cs.reorder_camps(ids)
+            _refresh_camp_list()
+            # 保持选中
+            camp_list.selection_set(new_idx)
+            self._refresh_camp_tags()
+            self._refresh_character_list()
 
         def _refresh_camp_list():
             camp_list.delete(0, "end")
@@ -2646,35 +2708,46 @@ class CharacterPanel(BasePanel):
         def _save_camp():
             name = name_var.get().strip()
             if not name:
+                messagebox.showwarning("提示", "请输入阵营名称")
                 return
-            sel = camp_list.curselection()
-            camps = cs.list_camps()
-            if sel and sel[0] < len(camps):
-                cs.update_camp(camps[sel[0]].camp_id, name=name, description=desc_var.get())
-            else:
-                cs.create_camp(name, desc_var.get())
-            _refresh_camp_list()
-            name_var.set("")
-            desc_var.set("")
-            self._refresh_camp_tags()
-            if self._current_char_id:
-                # auto-add camp to current character
-                new_camps = cs.list_camps()
-                if new_camps:
+            try:
+                sel = camp_list.curselection()
+                camps = cs.list_camps()
+                if sel and sel[0] < len(camps):
+                    cs.update_camp(camps[sel[0]].camp_id, name=name, description=desc_var.get())
+                else:
+                    cs.create_camp(name, desc_var.get())
+                _refresh_camp_list()
+                name_var.set("")
+                desc_var.set("")
+                self._refresh_camp_tags()
+                self._refresh_character_list()
+                # ★ auto-add new camp to current character
+                if self._current_char_id:
                     char = cs.get_character(self._current_char_id)
-                    if char and new_camps[-1].camp_id not in char.camp_ids:
-                        cs.update_character(self._current_char_id,
-                            camp_ids=char.camp_ids + [new_camps[-1].camp_id])
-                        self._refresh_camp_tags()
+                    if char:
+                        new_camps = cs.list_camps()
+                        for camp in new_camps:
+                            if camp.name == name and camp.camp_id not in char.camp_ids:
+                                cs.update_character(self._current_char_id,
+                                    camp_ids=char.camp_ids + [camp.camp_id])
+                                self._refresh_camp_tags()
+                                break
+            except Exception as e:
+                messagebox.showerror("错误", f"保存阵营失败: {e}")
 
         def _delete_camp():
             sel = camp_list.curselection()
             if sel:
                 camps = cs.list_camps()
                 if sel[0] < len(camps) and messagebox.askyesno("确认删除", f"确定要删除阵营「{camps[sel[0]].name}」吗？"):
-                    cs.delete_camp(camps[sel[0]].camp_id)
-                    _refresh_camp_list()
-                    self._refresh_camp_tags()
+                    try:
+                        cs.delete_camp(camps[sel[0]].camp_id)
+                        _refresh_camp_list()
+                        self._refresh_camp_tags()
+                        self._refresh_character_list()
+                    except Exception as e:
+                        messagebox.showerror("错误", f"删除阵营失败: {e}")
 
         tk.Button(btn_frame, text="新建/更新", command=_save_camp,
                   font=("Microsoft YaHei", 9), bg="#0078d4", fg="white").pack(side="left", padx=4)
