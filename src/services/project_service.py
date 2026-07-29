@@ -729,6 +729,8 @@ class ProjectService:
 
     def _read_file(self, path: str) -> str:
         full = Path(path)
+        if not full.is_absolute() and self._get_project_dir():
+            full = self._get_project_dir() / path
         if not full.exists():
             return ""
         with open(full, "r", encoding="utf-8") as f:
@@ -736,12 +738,16 @@ class ProjectService:
 
     def _write_file(self, path: str, content: str):
         full = Path(path)
+        if not full.is_absolute() and self._get_project_dir():
+            full = self._get_project_dir() / path
         full.parent.mkdir(parents=True, exist_ok=True)
         with open(full, "w", encoding="utf-8") as f:
             f.write(content)
 
     def _read_json(self, path: str) -> dict | list:
         full = Path(path)
+        if not full.is_absolute() and self._get_project_dir():
+            full = self._get_project_dir() / path
         if not full.exists():
             return {} if full.suffix == ".json" else []
         with open(full, "r", encoding="utf-8") as f:
@@ -749,6 +755,8 @@ class ProjectService:
 
     def _write_json(self, path: str, data):
         full = Path(path)
+        if not full.is_absolute() and self._get_project_dir():
+            full = self._get_project_dir() / path
         full.parent.mkdir(parents=True, exist_ok=True)
         with open(full, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)

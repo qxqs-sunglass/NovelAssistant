@@ -2492,6 +2492,14 @@ class CharacterPanel(BasePanel):
             cs = self._project_service.character_service
             keyword = self._search_var.get().strip()
             chars = cs.search_characters(keyword) if keyword else cs.list_characters()
+            # ★ 排序必须与 _refresh_character_list 完全一致，否则索引错位
+            camps = cs.list_camps()
+            camp_order = {c.camp_id: i for i, c in enumerate(camps)}
+            def _sort_key(ch):
+                if not ch.camp_ids:
+                    return (9999, ch.name)
+                return (camp_order.get(ch.camp_ids[0], 9998), ch.name)
+            chars.sort(key=_sort_key)
             idx = sel[0]
             if idx < len(chars):
                 char = chars[idx]
