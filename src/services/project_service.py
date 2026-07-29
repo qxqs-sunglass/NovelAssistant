@@ -642,7 +642,7 @@ class ProjectService:
     ID = "ProjectService"
 
     def __init__(self, workspace_dir: str, event_bus=None, logger=None):
-        self._workspace_dir = Path(workspace_dir)
+        self._workspace_dir = Path(workspace_dir).resolve()
         self._event_bus = event_bus
         self._logger = logger
         self._current_project: str | None = None
@@ -691,35 +691,27 @@ class ProjectService:
             self._event_bus.publish(name, data, self.ID)
 
     def _read_file(self, path: str) -> str:
-        full = Path(path) if os.path.isabs(path) else (
-            self._get_project_dir() / path if self._get_project_dir() else Path(path)
-        )
+        full = Path(path)
         if not full.exists():
             return ""
         with open(full, "r", encoding="utf-8") as f:
             return f.read()
 
     def _write_file(self, path: str, content: str):
-        full = Path(path) if os.path.isabs(path) else (
-            self._get_project_dir() / path if self._get_project_dir() else Path(path)
-        )
+        full = Path(path)
         full.parent.mkdir(parents=True, exist_ok=True)
         with open(full, "w", encoding="utf-8") as f:
             f.write(content)
 
     def _read_json(self, path: str) -> dict | list:
-        full = Path(path) if os.path.isabs(path) else (
-            self._get_project_dir() / path if self._get_project_dir() else Path(path)
-        )
+        full = Path(path)
         if not full.exists():
             return {} if full.suffix == ".json" else []
         with open(full, "r", encoding="utf-8") as f:
             return json.load(f)
 
     def _write_json(self, path: str, data):
-        full = Path(path) if os.path.isabs(path) else (
-            self._get_project_dir() / path if self._get_project_dir() else Path(path)
-        )
+        full = Path(path)
         full.parent.mkdir(parents=True, exist_ok=True)
         with open(full, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)

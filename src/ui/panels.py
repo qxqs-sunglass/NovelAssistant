@@ -1042,10 +1042,17 @@ class OutlinePanel(BasePanel):
             menu.add_command(label=p.name,
                              command=lambda n=p.name: self._switch_project(n))
         current = self._project_service.get_current_project()
+        # ★ 使用 trace 开关防止 set() 触发 OptionMenu 回调 → _switch_project 递归刷新
+        self._suppress_project_callback = True
         self._project_var.set(current or "无项目")
+        self._suppress_project_callback = False
 
     def _switch_project(self, name: str):
-        # 如果正在切换同一个项目，跳过以避免递归刷新
+        # 防止 OptionMenu 回调在 _refresh_project_list 内部触发递归
+        if getattr(self, '_suppress_project_callback', False):
+            return
+        if not name or name == "无项目":
+            return
         if name == self._project_service.get_current_project():
             return
         self._auto_save_if_dirty()
