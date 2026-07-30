@@ -2995,10 +2995,39 @@ class StatusPanel(BasePanel):
                   padx=16, pady=6, command=self._on_ai_generate).pack()
 
     def on_show(self):
-        self._refresh_basic_status()
+        # ★ 加载已保存的创作状态（持久化）
+        self._load_saved_status()
 
-    def _refresh_basic_status(self):
-        """刷新基础统计（不调用 AI）"""
+    def _load_saved_status(self):
+        """从项目目录加载已保存的创作状态"""
+        try:
+            ps = self._project_service
+            if not ps.get_current_project():
+                self._set_status_content("（暂无项目，请先在大纲面板创建或选择项目）")
+                return
+            proj_dir = ps._get_project_dir()
+            if proj_dir:
+                status_file = proj_dir / "status.md"
+                if status_file.exists():
+                    with open(status_file, "r", encoding="utf-8") as f:
+                        self._set_status_content(f.read())
+                else:
+                    self._show_basic_stats()
+        except Exception:
+            self._show_basic_stats()
+
+    def _save_status(self, content: str):
+        """保存创作状态到项目目录"""
+        try:
+            ps = self._project_service
+            proj_dir = ps._get_project_dir()
+            if proj_dir:
+                (proj_dir / "status.md").write_text(content, encoding="utf-8")
+        except Exception:
+            pass
+
+    def _show_basic_stats(self):
+        """显示基础统计"""
         try:
             ps = self._project_service
             if not ps.get_current_project():
@@ -3008,20 +3037,16 @@ class StatusPanel(BasePanel):
             completed = sum(1 for n in tree if n.status.value == "completed")
             l5_nodes = [n for n in tree if n.level.value == 5]
             total_words = sum(n.word_count for n in l5_nodes)
-
             lines = [
-                "📊 基本信息",
-                f"   当前项目: {ps.get_current_project()}",
-                f"   总大纲节点: {total_nodes}",
-                f"   已完成节点: {completed}",
-                f"   L5 正文章节数: {len(l5_nodes)}",
-                f"   总字数: {total_words:,}",
-                "",
-                "💡 点击下方按钮，让 AI 分析并生成完整的创作状态摘要。",
+                f"📊 {ps.get_current_project()} — 大纲节点 {total_nodes} | 完成 {completed} | 正文 {len(l5_nodes)}章 | {total_words:,}字\n",
+                "💡 点击下方按钮，让 AI 分析进度并给出创作建议。",
             ]
             self._set_status_content("\n".join(lines))
         except Exception:
             pass
+
+    def _refresh_basic_status(self):
+        self._load_saved_status()
 
     def _set_status_content(self, text: str):
         self._status_display.config(state="normal")
@@ -3066,42 +3091,54 @@ class StatusPanel(BasePanel):
         ):
             return
 
-        # 收集数据
+        # 收集数据：项目概况 → 大纲树 → 角色 → 设定 → 伏笔
         try:
             ps = self._project_service
             data_parts = []
 
-            # 1. 大纲 L1~L4
-            outline_nodes = [n for n in ps.get_outline_tree() if n.level.value <= 4]
-            if outline_nodes:
-                data_parts.append("【大纲结构】")
-                for n in outline_nodes:
-                    level_name = {1: "L1-大纲", 2: "L2-卷纲", 3: "L3-简纲", 4: "L4-章纲"}.get(n.level.value, "")
-                    node = ps.get_node(n.node_id)
-                    content_preview = (node.content[:300] + "...") if node and node.content else "(无内容)"
-                    data_parts.append(f"- [{level_name}] {n.title}\n  {content_preview}")
+            all_nodes = ps.get_outline_tree()
+            l1_l4 = [n for n in all_nodes if n.level.value <= 4]
+            l5_nodes = [n for n in all_nodes if n.level.value == 5]
+            completed_l5 = sum(1 for n in l5_nodes if n.status.value == "completed")
+            total_words = sum(n.word_count for n in l5_nodes)
+            completed_nodes = sum(1 for n in all_nodes if n.status.value == "completed")
 
-            # 2. 角色信息
+            # 1. 项目概况
+            data_parts.append(f"【项目概况】\n项目: {ps.get_current_project()}\n"
+                f"大纲节点: {len(l1_l4)} (已完成 {completed_nodes})\n"
+                f"正文: {len(l5_nodes)} 章 ({completed_l5} 已完成) | 总字数: {total_words:,}")
+
+            # 2. 大纲 L1~L4（含完整内容）
+            if l1_l4:
+                data_parts.append("\n【大纲树】")
+                for n in sorted(l1_l4, key=lambda x: (x.level.value, x.order)):
+                    level_name = {1: "L1-大纲", 2: "L2-卷纲", 3: "L3-简纲", 4: "L4-章纲"}.get(n.level.value, "")
+                    status_icon = {"completed": "✓", "in_progress": "●", "todo": "○", "ignored": "⊘"}.get(n.status.value, "○")
+                    node = ps.get_node(n.node_id)
+                    content = node.content if node and node.content else "(无内容)"
+                    data_parts.append(f"- [{level_name}] {status_icon} {n.title}\n  {content}")
+
+            # 3. 角色信息
             cs = ps.character_service
             char_ctx = cs.get_ai_context()
             if char_ctx:
                 data_parts.append("\n" + char_ctx)
 
-            # 3. 设定信息
+            # 4. 设定信息
             categories = ps.list_categories()
             if categories:
-                data_parts.append("\n【设定分类】")
+                data_parts.append("\n【设定信息】")
                 for cat in categories:
                     docs = ps.list_docs(cat)
                     if docs:
                         data_parts.append(f"\n## {cat}")
-                        for doc_name in docs[:5]:  # 每分类最多5篇
+                        for doc_name in docs[:5]:
                             content = ps.get_setting(cat, doc_name)
                             if content:
-                                preview = content[:200] + "..." if len(content) > 200 else content
-                                data_parts.append(f"- {doc_name}: {preview}")
+                                preview = content[:300] + "..." if len(content) > 300 else content
+                                data_parts.append(f"- {doc_name}:\n  {preview}")
 
-            # 4. 伏笔信息
+            # 5. 伏笔信息
             fs = ps.foreshadow_service
             foreshadow_ctx = fs.get_ai_context()
             if foreshadow_ctx:
@@ -3109,17 +3146,16 @@ class StatusPanel(BasePanel):
 
             full_data = "\n".join(data_parts)
 
-            # 构建 prompt
+            # ★ 精简提示词：针对作者给出方向性建议，限制字数
             prompt = (
-                "你是一位专业的小说创作分析助手。请根据以下创作数据，生成一份结构化的创作状态摘要。\n\n"
-                "请包含以下内容：\n"
-                "1. 📖 整体进度概览（大纲完成度、正文完成度）\n"
-                "2. 📈 各故事线分析（识别主要故事线，评估各自进度）\n"
-                "3. 👤 角色使用情况（主要角色是否都有足够的出场和设定）\n"
-                "4. 🔮 伏笔回收状态（列出已知伏笔，评估回收进度）\n"
-                "5. 💡 创作建议（基于当前进度给出下一步创作方向）\n\n"
-                "=== 创作数据 ===\n"
-                f"{full_data}"
+                "你是一位资深网文编辑。以下是作者当前的创作进度，请用 200~400 字给出针对性建议：\n\n"
+                f"项目: {ps.get_current_project()}\n"
+                f"大纲节点: {len(l1_l4)} | 正文: {len(l5_nodes)}章 ({completed_l5}完成) | 总字数: {total_words:,}\n\n"
+                f"{full_data}\n\n"
+                "请直接输出（不要客套、不要标题、不要列表格式）：\n"
+                "1. 当前进度的卡点或薄弱环节是什么？\n"
+                "2. 下一步最应该做什么（给 1~2 个具体方向）？\n"
+                "3. 用一句话总结当前创作状态。"
             )
 
             messages = [ChatMessage("user", prompt)]
@@ -3136,7 +3172,12 @@ class StatusPanel(BasePanel):
                         if chunk:
                             result_buffer.append(chunk)
                     full_text = "".join(result_buffer)
-                    self.frame.after(0, lambda: self._set_status_content(full_text))
+                    # ★ 持久化保存，并添加时间戳
+                    from datetime import datetime
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    saved = f"🕐 {ts} | 共 {total_words:,} 字\n\n{full_text}"
+                    self.frame.after(0, lambda: self._set_status_content(saved))
+                    self._save_status(saved)
                 except Exception as e:
                     self.frame.after(0, lambda: self._set_status_content(f"❌ 生成失败: {e}"))
 
