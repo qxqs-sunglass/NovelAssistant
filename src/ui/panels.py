@@ -2856,9 +2856,10 @@ class ForeshadowPanel(BasePanel):
             for f in items:
                 status = "👁 隐藏" if f.hidden else "◎"
                 tags = ("hidden",) if f.hidden else ()
-                self._foreshadow_tree.insert("", "end", values=(f.content, status), tags=tags)
+                # ★ 使用 foreshadow_id 作为 Treeview iid，消除索引偏移
+                self._foreshadow_tree.insert("", "end", iid=f.foreshadow_id,
+                    values=(f.content, status), tags=tags)
             self._foreshadow_tree.tag_configure("hidden", foreground="gray")
-            # 更新计数
             count = len(items)
             hidden_count = sum(1 for f_ in items if f_.hidden)
             self.logger.log(f"伏笔: {count} 条 (含 {hidden_count} 隐藏)", "ForeshadowPanel", "INFO")
@@ -2880,16 +2881,15 @@ class ForeshadowPanel(BasePanel):
         sel = self._foreshadow_tree.selection()
         if not sel:
             return None
-        fs = self._project_service.foreshadow_service
-        include = self._show_hidden.get()
-        items = fs.list_foreshadows(include_hidden=include)
-        idx = self._foreshadow_tree.index(sel[0])
-        if idx < len(items):
-            return items[idx].foreshadow_id
-        return None
+        # ★ iid 直接就是 foreshadow_id，无需索引转换
+        return sel[0]
 
     def _on_edit(self, event=None):
         fid = self._get_selected_id()
+        # ★ 如果 selection 获取不到，尝试从事件坐标取行
+        if not fid and event:
+            item = self._foreshadow_tree.identify_row(event.y)
+            fid = item if item else None
         if not fid:
             return
         fs = self._project_service.foreshadow_service
@@ -2898,37 +2898,68 @@ class ForeshadowPanel(BasePanel):
             return
         dialog = tk.Toplevel(self.frame)
         dialog.title("编辑伏笔")
-        dialog.geometry("400x200")
+        dialog.geometry("500x350")
+        dialog.minsize(400, 250)
         dialog.transient(self.frame)
         dialog.grab_set()
         text = tk.Text(dialog, font=("Microsoft YaHei", 10), wrap="word")
         text.insert("1.0", f.content)
-        text.pack(fill="both", expand=True, padx=8, pady=8)
+        text.pack(fill="both", expand=True, padx=8, pady=(8, 0))
 
         def _save():
             new_content = text.get("1.0", "end-1c").strip()
-            if new_content:
+            if not new_content:
+                messagebox.showwarning("提示", "内容不能为空", parent=dialog)
+                return
+            try:
                 fs.update_foreshadow(fid, new_content)
                 self._refresh_list()
+                dialog.destroy()
+            except Exception as e:
+                messagebox.showerror("保存失败", f"伏笔保存失败: {e}", parent=dialog)
+
+        # ★ 点击 X 关闭时也尝试保存（不丢失内容）
+        def _on_close():
+            content_now = text.get("1.0", "end-1c").strip()
+            if content_now and content_now != f.content:
+                if messagebox.askyesno("未保存", "内容已修改，是否保存？", parent=dialog):
+                    _save()
+                    return
             dialog.destroy()
 
-        tk.Button(dialog, text="保存", command=_save,
-                  font=("Microsoft YaHei", 10), bg="#0078d4", fg="white").pack(pady=4)
+        dialog.protocol("WM_DELETE_WINDOW", _on_close)
+
+        # 按钮栏（底部固定，不被文本框压缩）
+        btn_bar = tk.Frame(dialog)
+        btn_bar.pack(fill="x", padx=8, pady=8)
+        tk.Button(btn_bar, text="💾 保存", command=_save,
+                  font=("Microsoft YaHei", 10), bg="#0078d4", fg="white").pack(side="right", padx=2)
+        tk.Button(btn_bar, text="取消", command=dialog.destroy,
+                  font=("Microsoft YaHei", 10)).pack(side="right", padx=2)
 
     def _on_toggle(self, event=None):
         fid = self._get_selected_id()
+        if not fid and event:
+            item = self._foreshadow_tree.identify_row(event.y)
+            fid = item if item else None
         if fid:
-            self._project_service.foreshadow_service.toggle_hidden(fid)
-            self._refresh_list()
+            try:
+                self._project_service.foreshadow_service.toggle_hidden(fid)
+                self._refresh_list()
+            except Exception as e:
+                messagebox.showerror("错误", f"切换失败: {e}")
 
     def _on_delete(self, event=None):
         fid = self._get_selected_id()
+        if not fid and event:
+            item = self._foreshadow_tree.identify_row(event.y)
+            fid = item if item else None
         if fid and messagebox.askyesno("确认删除", "确定要删除这条伏笔吗？"):
             try:
                 self._project_service.foreshadow_service.delete_foreshadow(fid)
                 self._refresh_list()
-            except ValueError as e:
-                messagebox.showerror("错误", str(e))
+            except Exception as e:
+                messagebox.showerror("错误", f"删除失败: {e}")
 
     def _on_right_click(self, event):
         sel = self._foreshadow_tree.identify_row(event.y)
