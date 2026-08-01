@@ -257,6 +257,47 @@ class ChatPanel(BasePanel):
             self._tool_enabled.set(cfg.tool_enabled)
         # 强制刷新项目显示
         self._sync_project_display()
+        # ★ 恢复上次使用的提示词
+        self._load_prompt_state()
+
+    def on_close(self):
+        """关闭时保存提示词状态"""
+        self._save_prompt_state()
+
+    # ── 提示词持久化 ──
+    def _save_prompt_state(self):
+        """保存当前提示词内容和选中状态到 ConfigManager"""
+        if not self._config_manager:
+            return
+        try:
+            sys_content = self._sys_prompt_text.get("1.0", "end-1c").strip()
+            add_content = self._add_prompt_text.get("1.0", "end-1c").strip()
+            add_enabled = self._add_prompt_enabled.get()
+            # 使用特殊名称存储运行时状态
+            self._config_manager.save_prompt("__last_sys_prompt", sys_content, "system")
+            self._config_manager.save_prompt("__last_add_prompt", add_content, "additional")
+            self._config_manager.save_prompt("__last_add_enabled", "1" if add_enabled else "0", "additional")
+        except Exception:
+            pass
+
+    def _load_prompt_state(self):
+        """从 ConfigManager 恢复上次的提示词"""
+        if not self._config_manager:
+            return
+        try:
+            for p in self._config_manager.list_prompts("system"):
+                if p["name"] == "__last_sys_prompt" and p["content"]:
+                    self._sys_prompt_text.delete("1.0", "end")
+                    self._sys_prompt_text.insert("1.0", p["content"])
+                    break
+            for p in self._config_manager.list_prompts("additional"):
+                if p["name"] == "__last_add_prompt" and p["content"]:
+                    self._add_prompt_text.delete("1.0", "end")
+                    self._add_prompt_text.insert("1.0", p["content"])
+                if p["name"] == "__last_add_enabled":
+                    self._add_prompt_enabled.set(p["content"] == "1")
+        except Exception:
+            pass
 
     # ── 提示词管理 ──
 
@@ -576,6 +617,8 @@ class ChatPanel(BasePanel):
         self._append_message("system", "⏹ 已停止生成")
 
     def _on_send(self, event=None):
+        # ★ 每次发送消息前保存提示词状态
+        self._save_prompt_state()
         text = self._input_text.get("1.0", "end-1c").strip()
         if not text or self._is_streaming:
             return "break"
@@ -2294,6 +2337,18 @@ class ConfigPanel(BasePanel):
         self._config_manager.set_api_key(name, api_key)
         self._current_source_name = name
         self._refresh_source_list()
+        # ★ 如果是当前激活的源，立即重新配置 AIClient
+        current = self._config_manager.get_current_ai_source()
+        if current and current.name == name:
+            self._ai_client.configure(
+                base_url=source.base_url,
+                api_key=api_key,
+                model=source.model,
+                model_minor=source.model_minor,
+                temperature=source.temperature,
+                top_p=source.top_p,
+                max_tokens=source.max_tokens,
+            )
         messagebox.showinfo("保存成功", f"AI 源「{name}」已保存")
 
     def _set_as_current(self):

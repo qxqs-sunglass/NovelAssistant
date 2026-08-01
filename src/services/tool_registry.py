@@ -128,18 +128,25 @@ def create_tools(project_service) -> ToolRegistry:
 
     registry.register(ToolDef(
         name="read_setting",
-        description="读取指定设定文档的完整 Markdown 内容",
+        description="读取设定文档内容。可传单个文档名或文档名数组批量读取，提高效率",
         parameters={
             "type": "object",
             "properties": {
                 "category": {"type": "string", "description": "设定分类名"},
-                "doc": {"type": "string", "description": "文档名（不含 .md）"},
+                "doc": {
+                    "description": "文档名（字符串）或文档名数组（批量读取）",
+                },
             },
             "required": ["category", "doc"],
         },
-        handler=lambda args: {
-            "content": project_service.get_setting(args["category"], args["doc"]) or "(文档不存在)",
-        },
+        handler=lambda args: (
+            # 批量读取
+            {d: project_service.get_setting(args["category"], d) or "(不存在)"
+             for d in args["doc"]}
+            if isinstance(args.get("doc"), list)
+            # 单文档读取
+            else {"content": project_service.get_setting(args["category"], args["doc"]) or "(文档不存在)"}
+        ),
     ))
 
     registry.register(ToolDef(
@@ -164,18 +171,32 @@ def create_tools(project_service) -> ToolRegistry:
 
     registry.register(ToolDef(
         name="read_chapter",
-        description="读取指定大纲节点或章节的 Markdown 内容。请先通过 list_outline 了解节点结构",
+        description="读取大纲节点/章节内容。可传单个节点 ID 或 ID 数组批量读取，提高效率",
         parameters={
             "type": "object",
             "properties": {
-                "node_id": {"type": "string", "description": "大纲节点 ID"},
+                "node_id": {
+                    "description": "大纲节点 ID（字符串）或 ID 数组（批量读取）",
+                },
             },
             "required": ["node_id"],
         },
         handler=lambda args: (
-            {"content": project_service.get_node(args["node_id"]).content}
-            if project_service.get_node(args["node_id"])
-            else {"error": "节点不存在"}
+            # 批量读取
+            {
+                nid: (
+                    project_service.get_node(nid).content
+                    if project_service.get_node(nid) else "(不存在)"
+                )
+                for nid in args["node_id"]
+            }
+            if isinstance(args.get("node_id"), list)
+            # 单节点读取
+            else (
+                {"content": project_service.get_node(args["node_id"]).content}
+                if project_service.get_node(args["node_id"])
+                else {"error": "节点不存在"}
+            )
         ),
     ))
 
@@ -374,33 +395,44 @@ def create_tools(project_service) -> ToolRegistry:
 
     registry.register(ToolDef(
         name="read_character",
-        description="读取指定角色的完整信息，包含简介（Markdown）、性别、年龄、生日、所属阵营等",
+        description="读取角色完整信息。可传单个角色 ID 或 ID 数组批量读取，提高效率",
         parameters={
             "type": "object",
             "properties": {
-                "char_id": {"type": "string", "description": "角色 ID（通过 list_characters 获取）"},
+                "char_id": {
+                    "description": "角色 ID（字符串）或 ID 数组（批量读取多个角色）",
+                },
             },
             "required": ["char_id"],
         },
         handler=lambda args: (
-            lambda ch: (
-                {
-                    "char_id": ch.char_id,
-                    "name": ch.name,
-                    "gender": ch.gender,
-                    "age": ch.age,
-                    "birthday": ch.birthday,
-                    "bio": ch.bio,
-                    "camps": [
-                        project_service.character_service.get_camp(cid).name
-                        if project_service.character_service.get_camp(cid)
-                        else cid
-                        for cid in ch.camp_ids
-                    ],
-                }
-                if ch else {"error": "角色不存在"}
-            )
-        )(project_service.character_service.get_character(args["char_id"])),
+            # 批量读取
+            {
+                cid: (
+                    lambda ch: (
+                        {"char_id": ch.char_id, "name": ch.name, "gender": ch.gender,
+                         "age": ch.age, "birthday": ch.birthday, "bio": ch.bio,
+                         "camps": [project_service.character_service.get_camp(cid2).name
+                                   if project_service.character_service.get_camp(cid2) else cid2
+                                   for cid2 in ch.camp_ids]}
+                        if ch else {"error": "角色不存在"}
+                    )
+                )(project_service.character_service.get_character(cid))
+                for cid in args["char_id"]
+            }
+            if isinstance(args.get("char_id"), list)
+            # 单角色读取
+            else (
+                lambda ch: (
+                    {"char_id": ch.char_id, "name": ch.name, "gender": ch.gender,
+                     "age": ch.age, "birthday": ch.birthday, "bio": ch.bio,
+                     "camps": [project_service.character_service.get_camp(cid).name
+                               if project_service.character_service.get_camp(cid) else cid
+                               for cid in ch.camp_ids]}
+                    if ch else {"error": "角色不存在"}
+                )
+            )(project_service.character_service.get_character(args["char_id"]))
+        ),
     ))
 
     registry.register(ToolDef(
@@ -475,21 +507,38 @@ def create_tools(project_service) -> ToolRegistry:
 
     registry.register(ToolDef(
         name="read_foreshadow",
-        description="读取单条伏笔的完整信息",
+        description="读取伏笔信息。可传单个伏笔 ID 或 ID 数组批量读取",
         parameters={
             "type": "object",
             "properties": {
-                "foreshadow_id": {"type": "string", "description": "伏笔 ID"},
+                "foreshadow_id": {
+                    "description": "伏笔 ID（字符串）或 ID 数组（批量读取）",
+                },
             },
             "required": ["foreshadow_id"],
         },
         handler=lambda args: (
-            lambda f: (
-                {"id": f.foreshadow_id, "content": f.content, "hidden": f.hidden,
-                 "created_at": f.created_at}
-                if f else {"error": "伏笔不存在"}
-            )
-        )(project_service.foreshadow_service.get_foreshadow(args["foreshadow_id"])),
+            # 批量
+            {
+                fid: (
+                    lambda f: (
+                        {"id": f.foreshadow_id, "content": f.content, "hidden": f.hidden,
+                         "created_at": f.created_at}
+                        if f else {"error": "伏笔不存在"}
+                    )
+                )(project_service.foreshadow_service.get_foreshadow(fid))
+                for fid in args["foreshadow_id"]
+            }
+            if isinstance(args.get("foreshadow_id"), list)
+            # 单个
+            else (
+                lambda f: (
+                    {"id": f.foreshadow_id, "content": f.content, "hidden": f.hidden,
+                     "created_at": f.created_at}
+                    if f else {"error": "伏笔不存在"}
+                )
+            )(project_service.foreshadow_service.get_foreshadow(args["foreshadow_id"]))
+        ),
     ))
 
     registry.register(ToolDef(
