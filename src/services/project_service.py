@@ -954,7 +954,9 @@ class ProjectService:
         parent = self.get_node(parent_id)
         if parent is None:
             return []
-        return [n for n in self.get_outline_tree() if n.node_id in parent.children_ids]
+        by_id = {n.node_id: n for n in self.get_outline_tree()}
+        # ★ 按 parent.children_ids 的顺序返回，而非字典插入顺序
+        return [by_id[cid] for cid in parent.children_ids if cid in by_id]
 
     def create_node(self, parent_id: str | None, title: str,
                     level: OutlineLevel, content: str = "",

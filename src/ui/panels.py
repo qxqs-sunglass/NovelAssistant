@@ -1700,10 +1700,11 @@ class OutlinePanel(BasePanel):
             return
         self._on_node_rename(None)
 
-    # ── 排序（上下移动子节点） ──
-
+    # ── 排序（上下移动节点） ──
     def _move_child_up(self):
-        """将子节点列表中选中的节点上移一位"""
+        """将选中的节点上移一位（优先基于大纲树选中，回退到子节点列表）"""
+        if self._move_tree_node(-1):
+            return
         if not self._current_node_id:
             return
         selected = self._child_list.curselection()
@@ -1714,7 +1715,6 @@ class OutlinePanel(BasePanel):
             return
         self._auto_save_if_dirty()
         children = self._project_service.get_children(self._current_node_id)
-        # 交换顺序
         children[idx], children[idx - 1] = children[idx - 1], children[idx]
         ordered_ids = [c.node_id for c in children]
         self._project_service.reorder_siblings(self._current_node_id, ordered_ids)
@@ -1722,7 +1722,9 @@ class OutlinePanel(BasePanel):
         self._child_list.selection_set(idx - 1)
 
     def _move_child_down(self):
-        """将子节点列表中选中的节点下移一位"""
+        """将选中的节点下移一位（优先基于大纲树选中，回退到子节点列表）"""
+        if self._move_tree_node(1):
+            return
         if not self._current_node_id:
             return
         selected = self._child_list.curselection()
@@ -1733,12 +1735,44 @@ class OutlinePanel(BasePanel):
         if idx >= len(children) - 1:
             return
         self._auto_save_if_dirty()
-        # 交换顺序
         children[idx], children[idx + 1] = children[idx + 1], children[idx]
         ordered_ids = [c.node_id for c in children]
         self._project_service.reorder_siblings(self._current_node_id, ordered_ids)
         self._refresh_children()
         self._child_list.selection_set(idx + 1)
+
+    def _move_tree_node(self, delta: int) -> bool:
+        """基于大纲树当前选中节点，在同级中上移(-1)/下移(+1)
+        Returns:
+            True=已执行移动；False=无选中节点或已在边界
+        """
+        selection = self._tree.selection()
+        if not selection:
+            return False
+        node_id = selection[0]
+        node = self._project_service.get_node(node_id)
+        if node is None:
+            return False
+        parent_id = node.parent_id
+        # 根节点（parent_id 为 None）不可在同级移动
+        if parent_id is None:
+            return False
+        siblings = self._project_service.get_children(parent_id)
+        ids = [s.node_id for s in siblings]
+        idx = ids.index(node_id) if node_id in ids else -1
+        if idx < 0:
+            return False
+        new_idx = idx + delta
+        if new_idx < 0 or new_idx >= len(ids):
+            return False
+        self._auto_save_if_dirty()
+        ids[idx], ids[new_idx] = ids[new_idx], ids[idx]
+        self._project_service.reorder_siblings(parent_id, ids)
+        self._refresh_tree()
+        # 保持选中状态
+        self._tree.selection_set(node_id)
+        self._tree.focus(node_id)
+        return True
 
     def _refresh_children(self):
         """刷新子节点列表（不刷新整棵树）"""
@@ -2904,38 +2938,22 @@ class ForeshadowPanel(BasePanel):
         dialog.grab_set()
         text = tk.Text(dialog, font=("Microsoft YaHei", 10), wrap="word")
         text.insert("1.0", f.content)
-        text.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+        text.pack(fill="both", expand=True, padx=8, pady=8)
 
-        def _save():
-            new_content = text.get("1.0", "end-1c").strip()
-            if not new_content:
-                messagebox.showwarning("提示", "内容不能为空", parent=dialog)
-                return
-            try:
-                fs.update_foreshadow(fid, new_content)
-                self._refresh_list()
-                dialog.destroy()
-            except Exception as e:
-                messagebox.showerror("保存失败", f"伏笔保存失败: {e}", parent=dialog)
-
-        # ★ 点击 X 关闭时也尝试保存（不丢失内容）
+        # ★ 自动保存：关闭时自动保存当前内容
         def _on_close():
-            content_now = text.get("1.0", "end-1c").strip()
-            if content_now and content_now != f.content:
-                if messagebox.askyesno("未保存", "内容已修改，是否保存？", parent=dialog):
-                    _save()
-                    return
+            new_content = text.get("1.0", "end-1c").strip()
+            try:
+                if new_content and new_content != f.content:
+                    fs.update_foreshadow(fid, new_content)
+                    self._refresh_list()
+            except Exception:
+                pass
             dialog.destroy()
 
         dialog.protocol("WM_DELETE_WINDOW", _on_close)
-
-        # 按钮栏（底部固定，不被文本框压缩）
-        btn_bar = tk.Frame(dialog)
-        btn_bar.pack(fill="x", padx=8, pady=8)
-        tk.Button(btn_bar, text="💾 保存", command=_save,
-                  font=("Microsoft YaHei", 10), bg="#0078d4", fg="white").pack(side="right", padx=2)
-        tk.Button(btn_bar, text="取消", command=dialog.destroy,
-                  font=("Microsoft YaHei", 10)).pack(side="right", padx=2)
+        # 键盘 Escape 也触��关闭（自动保存）
+        dialog.bind("<Escape>", lambda e: _on_close())
 
     def _on_toggle(self, event=None):
         fid = self._get_selected_id()
