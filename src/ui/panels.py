@@ -56,6 +56,17 @@ class BasePanel(ABC):
 class ChatPanel(BasePanel):
     """AI 对话面板 — 含提示词选择、内容勾选、工具调用"""
 
+    # ★ v2.2 内置 Skill 文本
+    SKILL = (
+        "【工作流】全局工作流程\n"
+        "【数据来源】当前项目数据库\n"
+        "【执行步骤】\n"
+        "1. 分析用户指令，将需要用到的大纲文档、设定信息、角色信息、伏笔信息，利用统一读取工具一口气批量读取。\n"
+        "2. 执行用户指令进行内容生成。\n"
+        "3. 分析伏笔条目，锁定可能需要删除的伏笔，利用读取工具进行读取。\n"
+        "4. 使用伏笔工具，对已有的伏笔进行增删。"
+    )
+
     def __init__(self, parent, event_bus, logger,
                  ai_client: AIClient, session_manager: SessionManager,
                  project_service: ProjectService):
@@ -257,45 +268,35 @@ class ChatPanel(BasePanel):
             self._tool_enabled.set(cfg.tool_enabled)
         # 强制刷新项目显示
         self._sync_project_display()
-        # ★ 恢复上次使用的提示词
+        # ★ 恢复上次选择的提示词
         self._load_prompt_state()
-
-    def on_close(self):
-        """关闭时保存提示词状态"""
-        self._save_prompt_state()
 
     # ── 提示词持久化 ──
     def _save_prompt_state(self):
-        """保存当前提示词内容和选中状态到 ConfigManager"""
+        """保存当前选中的提示词名称到 AppConfig"""
         if not self._config_manager:
             return
         try:
-            sys_content = self._sys_prompt_text.get("1.0", "end-1c").strip()
-            add_content = self._add_prompt_text.get("1.0", "end-1c").strip()
-            add_enabled = self._add_prompt_enabled.get()
-            # 使用特殊名称存储运行时状态
-            self._config_manager.save_prompt("__last_sys_prompt", sys_content, "system")
-            self._config_manager.save_prompt("__last_add_prompt", add_content, "additional")
-            self._config_manager.save_prompt("__last_add_enabled", "1" if add_enabled else "0", "additional")
+            cfg = self._config_manager.load_app_config()
+            cfg.last_sys_prompt = self._sys_prompt_var.get()
+            cfg.last_add_prompt = self._add_prompt_var.get()
+            cfg.last_add_enabled = self._add_prompt_enabled.get()
+            self._config_manager.save_app_config(cfg)
         except Exception:
             pass
 
     def _load_prompt_state(self):
-        """从 ConfigManager 恢复上次的提示词"""
+        """从 AppConfig 恢复上次选中的提示词"""
         if not self._config_manager:
             return
         try:
-            for p in self._config_manager.list_prompts("system"):
-                if p["name"] == "__last_sys_prompt" and p["content"]:
-                    self._sys_prompt_text.delete("1.0", "end")
-                    self._sys_prompt_text.insert("1.0", p["content"])
-                    break
-            for p in self._config_manager.list_prompts("additional"):
-                if p["name"] == "__last_add_prompt" and p["content"]:
-                    self._add_prompt_text.delete("1.0", "end")
-                    self._add_prompt_text.insert("1.0", p["content"])
-                if p["name"] == "__last_add_enabled":
-                    self._add_prompt_enabled.set(p["content"] == "1")
+            cfg = self._config_manager.load_app_config()
+            if cfg.last_sys_prompt and cfg.last_sys_prompt != "无":
+                self._on_sys_prompt_selected(cfg.last_sys_prompt)
+            if cfg.last_add_prompt and cfg.last_add_prompt != "无":
+                self._on_add_prompt_selected(cfg.last_add_prompt)
+            if hasattr(cfg, 'last_add_enabled'):
+                self._add_prompt_enabled.set(cfg.last_add_enabled)
         except Exception:
             pass
 
@@ -564,29 +565,48 @@ class ChatPanel(BasePanel):
         summary = "【历史对话摘要】\n" + "\n".join(summary_parts)
         return [ChatMessage("system", summary)] + recent
 
-    # ★ v2.0: 状态和伏笔上下文采集
-    def _get_status_context(self) -> str:
-        """从 StatusPanel 获取当前创作状态"""
+    # ★ v2.2: 上下文构建方法
+
+    def _get_outline_tree_context(self) -> str:
+        """大纲树上下文 — 仅标题+层级+状态，不含节点内容"""
         try:
-            if hasattr(self, '_project_service') and self._project_service:
-                # 基本状态（不依赖 StatusPanel 实例）
-                ps = self._project_service
-                if ps.get_current_project():
-                    tree = ps.get_outline_tree()
-                    total = len(tree)
-                    completed = sum(1 for n in tree if n.status.value == "completed")
-                    l5_count = len([n for n in tree if n.level.value == 5])
-                    total_words = sum(n.word_count for n in tree if n.level.value == 5)
-                    return (
-                        f"【当前创作状态】\n"
-                        f"项目: {ps.get_current_project()}\n"
-                        f"大纲节点: {total} (已完成 {completed})\n"
-                        f"正文章节: {l5_count}\n"
-                        f"总字数: {total_words:,}"
-                    )
+            ps = self._project_service
+            if not ps or not ps.get_current_project():
+                return ""
+            nodes = ps.get_outline_tree()
+            if not nodes:
+                return ""
+            lines = []
+            for n in sorted(nodes, key=lambda x: (x.level.value, x.order)):
+                level_name = {1:"L1", 2:"L2", 3:"L3", 4:"L4", 5:"L5"}.get(n.level.value, "")
+                status_icon = {"completed":"✓","in_progress":"●","todo":"○","ignored":"⊘"}.get(n.status.value, "○")
+                lines.append(f"[{level_name}] {status_icon} {n.title} (id={n.node_id})")
+            return "\n".join(lines)
         except Exception:
-            pass
-        return ""
+            return ""
+
+    def _get_character_summary_context(self) -> str:
+        """角色集上下文 — 仅姓名+性别+阵营，不含简介"""
+        try:
+            return self._project_service.character_service.get_ai_context()
+        except Exception:
+            return ""
+
+    def _get_settings_summary_context(self) -> str:
+        """设定集上下文 — 分类名+文档名，不含内容"""
+        try:
+            ps = self._project_service
+            cats = ps.list_categories()
+            if not cats:
+                return ""
+            lines = []
+            for cat in cats:
+                docs = ps.list_docs(cat)
+                if docs:
+                    lines.append(f"- {cat}: {', '.join(docs)}")
+            return "\n".join(lines) if lines else ""
+        except Exception:
+            return ""
 
     def _get_foreshadow_context(self) -> str:
         """从 ForeshadowService 获取未隐藏的伏笔"""
@@ -636,22 +656,42 @@ class ChatPanel(BasePanel):
         self._session_manager.add_message(
             self._current_session_id, "user", text, meta=user_meta)
 
-        # ★ v2.0: 按新顺序拼接上下文
-        # 1. 获取状态信息 (StatusPanel)
-        status_context = self._get_status_context()
-        # 2. 获取伏笔信息 (ForeshadowService, 仅 unhidden)
-        foreshadow_context = self._get_foreshadow_context()
-        # 3. 获取勾选内容（原有逻辑）
+        # ★ v2.2: Skill + 新上下文组装顺序
         selected = self._gather_selected_content()
 
-        # 组装: 消息 → 状态 → 伏笔 → 勾选内容
-        full_text = text
-        if status_context:
-            full_text += f"\n\n---\n{status_context}"
-        if foreshadow_context:
-            full_text += f"\n\n---\n{foreshadow_context}"
+        # 系统提示词 = 内置 Skill + 用户系统提示词 + 附加提示词
+        sys_prompt = self._sys_prompt_text.get("1.0", "end-1c").strip()
+        system_prompt = self.SKILL + "\n\n" + sys_prompt if sys_prompt else self.SKILL
+        if self._add_prompt_enabled.get():
+            add_prompt = self._add_prompt_text.get("1.0", "end-1c").strip()
+            if add_prompt:
+                system_prompt += "\n\n" + add_prompt
+
+        # 用户消息 = 文本 + 上下文数据
+        context_parts = []
+        # 大纲树（仅节点标题+层级+状态）
+        outline_ctx = self._get_outline_tree_context()
+        if outline_ctx:
+            context_parts.append(f"【大纲树】\n{outline_ctx}")
+        # 角色集（姓名+性别+阵营，不含简介）
+        char_ctx = self._get_character_summary_context()
+        if char_ctx:
+            context_parts.append(f"【角色集】\n{char_ctx}")
+        # 设定集（分类名+文档名，不含内容）
+        settings_ctx = self._get_settings_summary_context()
+        if settings_ctx:
+            context_parts.append(f"【设定集】\n{settings_ctx}")
+        # 伏笔条目
+        foreshadow_ctx = self._get_foreshadow_context()
+        if foreshadow_ctx:
+            context_parts.append(foreshadow_ctx)
+        # 勾选内容（完整内容）
         if selected:
-            full_text += f"\n\n---\n【以下为选中的已有内容供参考】\n{selected}"
+            context_parts.append(f"【勾选内容】\n{selected}")
+
+        full_text = text
+        if context_parts:
+            full_text += "\n\n---\n" + "\n\n---\n".join(context_parts)
 
         messages = [ChatMessage("user", full_text)]
         # 添加历史（排除 tool 消息 + 旧历史裁剪）
@@ -664,13 +704,6 @@ class ChatPanel(BasePanel):
             for m in history
         ]
         messages = self._trim_history(history_msgs) + messages
-
-        # 组合系统提示词 + 附加提示词（若启用）
-        system_prompt = self._sys_prompt_text.get("1.0", "end-1c").strip()
-        if self._add_prompt_enabled.get():
-            add_prompt = self._add_prompt_text.get("1.0", "end-1c").strip()
-            if add_prompt:
-                system_prompt = system_prompt + "\n\n" + add_prompt if system_prompt else add_prompt
 
         self._response_buffer = ""
         self._is_streaming = True
@@ -2254,9 +2287,11 @@ class ConfigPanel(BasePanel):
         tk.Label(global_tab, text="工具调用最大轮数（AI 连续调用工具的上限）:", bg="#ffffff",
                  font=("Microsoft YaHei", 10)).pack(anchor="w", padx=24, pady=(4, 2))
         self._global_max_rounds = tk.StringVar(value=str(cfg.max_tool_rounds))
-        tk.Spinbox(global_tab, from_=1, to=20, textvariable=self._global_max_rounds,
+        max_r_spin = tk.Spinbox(global_tab, from_=1, to=20, textvariable=self._global_max_rounds,
                    width=5, font=("Microsoft YaHei", 10),
-                   command=self._save_global_settings).pack(anchor="w", padx=24)
+                   command=self._save_global_settings)
+        max_r_spin.pack(anchor="w", padx=24)
+        max_r_spin.bind("<FocusOut>", lambda e: self._save_global_settings())
 
         ttk.Separator(global_tab, orient="horizontal").pack(fill="x", padx=24, pady=8)
 
@@ -2270,9 +2305,11 @@ class ConfigPanel(BasePanel):
         tk.Label(global_tab, text="日志保留天数:", bg="#ffffff",
                  font=("Microsoft YaHei", 10)).pack(anchor="w", padx=24, pady=(12, 2))
         self._global_log_days = tk.StringVar(value=str(cfg.log_retention_days))
-        tk.Spinbox(global_tab, from_=1, to=90, textvariable=self._global_log_days,
+        days_spin = tk.Spinbox(global_tab, from_=1, to=90, textvariable=self._global_log_days,
                    width=5, font=("Microsoft YaHei", 10),
-                   command=self._save_global_settings).pack(anchor="w", padx=24)
+                   command=self._save_global_settings)
+        days_spin.pack(anchor="w", padx=24)
+        days_spin.bind("<FocusOut>", lambda e: self._save_global_settings())
 
     def on_show(self):
         self._refresh_source_list()
@@ -3291,10 +3328,11 @@ class StatusPanel(BasePanel):
             self._set_status_content(f"❌ 数据收集失败: {e}")
 
     def get_ai_context(self) -> str:
-        """供 ChatPanel 调用：获取当前状态摘要"""
+        """供 ChatPanel 调用：获取当前状态摘要（仅返回 AI 生成的内容）"""
         try:
             content = self._status_display.get("1.0", "end-1c")
-            if content and "暂无数据" not in content and "AI 正在分析" not in content:
+            # ★ 仅返回 AI 生成的状态（以时间戳开头），排除基础统计和提示文字
+            if content and content.startswith("🕐"):
                 return f"【当前创作状态】\n{content}"
         except Exception:
             pass
