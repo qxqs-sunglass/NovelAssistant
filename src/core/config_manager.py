@@ -80,7 +80,7 @@ class AISourceConfig:
 @dataclass
 class AppConfig:
     """应用全局配置"""
-    version: str = "2.2.0"
+    version: str = "2.2.1"
     language: str = "zh-CN"
     window_width: int = 1200
     window_height: int = 700

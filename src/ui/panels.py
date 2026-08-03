@@ -568,7 +568,7 @@ class ChatPanel(BasePanel):
     # ★ v2.2: 上下文构建方法
 
     def _get_outline_tree_context(self) -> str:
-        """大纲树上下文 — 仅标题+层级+状态，不含节点内容"""
+        """大纲树上下文 — Linux 树形结构 + 节点ID + 特别标注"""
         try:
             ps = self._project_service
             if not ps or not ps.get_current_project():
@@ -576,46 +576,89 @@ class ChatPanel(BasePanel):
             nodes = ps.get_outline_tree()
             if not nodes:
                 return ""
+            # 按父子关系递归构建树形
+            children_map: dict[str, list] = {}
+            roots: list = []
+            for n in nodes:
+                if n.parent_id is None:
+                    roots.append(n)
+                else:
+                    children_map.setdefault(n.parent_id, []).append(n)
+            for v in children_map.values():
+                v.sort(key=lambda x: x.order)
+
             lines = []
-            for n in sorted(nodes, key=lambda x: (x.level.value, x.order)):
-                level_name = {1:"L1", 2:"L2", 3:"L3", 4:"L4", 5:"L5"}.get(n.level.value, "")
-                status_icon = {"completed":"✓","in_progress":"●","todo":"○","ignored":"⊘"}.get(n.status.value, "○")
-                lines.append(f"[{level_name}] {status_icon} {n.title} (id={n.node_id})")
+            # ★ 特别标注
+            lines.append("▼ 这就是项目大纲的树形结构，每行末尾带 (id=xxx)，可直接用 fetch 工具读取对应 id 的文档，无需额外调用 list_outline")
+
+            def _walk(node: OutlineNode, prefix: str, is_last: bool):
+                connector = "└── " if is_last else "├── "
+                level_name = {1: "L1", 2: "L2", 3: "L3", 4: "L4", 5: "L5"}.get(node.level.value, "")
+                status_icon = {"completed": "✓", "in_progress": "●", "todo": "○", "ignored": "⊘"}.get(node.status.value, "○")
+                lines.append(f"{prefix}{connector}{status_icon} {node.title} [{level_name}] (id={node.node_id})")
+                kids = children_map.get(node.node_id, [])
+                child_prefix = prefix + ("    " if is_last else "│   ")
+                for i, kid in enumerate(kids):
+                    _walk(kid, child_prefix, i == len(kids) - 1)
+
+            for i, root in enumerate(sorted(roots, key=lambda x: x.order)):
+                _walk(root, "", i == len(roots) - 1)
             return "\n".join(lines)
         except Exception:
             return ""
 
     def _get_character_summary_context(self) -> str:
-        """角色集上下文 — 仅姓名+性别+阵营，不含简介"""
+        """角色集上下文 — 姓名+ID+性别+阵营，不含简介"""
         try:
-            return self._project_service.character_service.get_ai_context()
+            cs = self._project_service.character_service
+            chars = cs.list_characters()
+            if not chars:
+                return ""
+            lines = ["▼ 角色列表，每行带 char_id，可直接用 fetch 工具读取对应角色的完整信息"]
+            for c in chars:
+                camp_names = []
+                for cid in c.camp_ids:
+                    camp = cs.get_camp(cid)
+                    if camp:
+                        camp_names.append(camp.name)
+                camps_str = f" [阵营: {', '.join(camp_names)}]" if camp_names else ""
+                gender_str = f" {c.gender}" if c.gender else ""
+                lines.append(f"- {c.name}{gender_str}{camps_str} (char_id={c.char_id})")
+            return "\n".join(lines)
         except Exception:
             return ""
 
     def _get_settings_summary_context(self) -> str:
-        """设定集上下文 — 分类名+文档名，不含内容"""
+        """设定集上下文 — 分类名+文档名，标注可直接用 fetch 读取"""
         try:
             ps = self._project_service
             cats = ps.list_categories()
             if not cats:
                 return ""
-            lines = []
+            lines = ["▼ 设定文档列表（category + doc 名），可直接用 fetch(target='setting', category=..., ids=[...]) 读取"]
             for cat in cats:
                 docs = ps.list_docs(cat)
                 if docs:
-                    lines.append(f"- {cat}: {', '.join(docs)}")
-            return "\n".join(lines) if lines else ""
+                    lines.append(f"## {cat}")
+                    for d in docs:
+                        lines.append(f"- {d} (category={cat})")
+            return "\n".join(lines) if len(lines) > 1 else ""
         except Exception:
             return ""
 
     def _get_foreshadow_context(self) -> str:
-        """从 ForeshadowService 获取未隐藏的伏笔"""
+        """伏笔上下文 — 未隐藏伏笔条目，含 ID，可直接用 fetch 读取"""
         try:
-            if hasattr(self, '_project_service') and self._project_service:
-                return self._project_service.foreshadow_service.get_ai_context()
+            fs = self._project_service.foreshadow_service
+            items = fs.list_foreshadows(include_hidden=False)
+            if not items:
+                return ""
+            lines = ["▼ 当前未隐藏伏笔条目，每行带 id，可直接用 fetch 读取"]
+            for i, f in enumerate(items, 1):
+                lines.append(f"{i}. {f.content} (id={f.foreshadow_id})")
+            return "\n".join(lines)
         except Exception:
-            pass
-        return ""
+            return ""
 
     def _toggle_prompts(self):
         """展开/收起提示词编辑面板"""
