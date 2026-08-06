@@ -328,6 +328,16 @@ class ChatPanel(BasePanel):
                 self._add_prompt_text.insert("1.0", add_content)
         except Exception:
             pass
+        # ★ 更新预览摘要
+        self._update_prompt_summary()
+
+    def _update_prompt_summary(self):
+        """更新提示词折叠栏的预览文字"""
+        try:
+            sp = self._sys_prompt_text.get("1.0", "end-1c").strip()
+            self._prompt_summary_var.set(sp[:50] + ("…" if len(sp) > 50 else "") if sp else "无")
+        except Exception:
+            pass
 
     # ── 提示词管理 ──
 
@@ -695,11 +705,11 @@ class ChatPanel(BasePanel):
             self._prompt_panel.pack_forget()
             self._prompts_visible = False
         else:
+            # ★ 展开前刷新提示词下拉列表，确保选项最新
+            self._refresh_prompt_list()
             self._prompt_panel.pack(fill="x", after=self._prompt_header)
             self._prompts_visible = True
-            # 刷新摘要
-            sp = self._sys_prompt_text.get("1.0", "end-1c").strip()
-            self._prompt_summary_var.set(sp[:50] + ("…" if len(sp) > 50 else "") if sp else "无")
+            self._update_prompt_summary()
 
     def _stop_streaming(self):
         """停止当前 AI 流式输出"""
@@ -1028,9 +1038,9 @@ class OutlinePanel(BasePanel):
         self._tree.bind("<<TreeviewSelect>>", self._on_node_selected)
         self._tree.bind("<Double-1>", self._on_node_rename)
         self._tree.bind("<Button-3>", self._on_tree_right_click)
-        # ★ v2.2.1: 展开/收起事件实时保存状态
-        self._tree.bind("<<TreeviewOpen>>", lambda e: self._save_expanded_state())
-        self._tree.bind("<<TreeviewClose>>", lambda e: self._save_expanded_state())
+        # ★ v2.2.1: 展开/收起时更新内存状态（不写磁盘，仅在 on_close 保存）
+        self._tree.bind("<<TreeviewOpen>>", lambda e: self._on_tree_toggle(e, True))
+        self._tree.bind("<<TreeviewClose>>", lambda e: self._on_tree_toggle(e, False))
 
         # 右键菜单
         self._tree_menu = tk.Menu(self.frame, tearoff=0)
@@ -1065,7 +1075,7 @@ class OutlinePanel(BasePanel):
         self._stats_body.pack(fill="both", expand=True)
         self._stats_labels: dict[str, tk.Label] = {}
 
-    # ── 中栏：子节点列表 + 操作按钮（多行布局） ──
+        # ── 中栏：子节点列表 + 操作按钮（多行布局） ──
         mid_frame = tk.Frame(paned, bg="#fafafa", width=200)
         paned.add(mid_frame)
 
@@ -1177,6 +1187,26 @@ class OutlinePanel(BasePanel):
         self.frame.bind("<Control-Left>", lambda e: self._promote_node())
         self.frame.bind("<Control-Right>", lambda e: self._demote_node())
 
+    def _on_tree_toggle(self, event, opened: bool):
+        """用户手动展开/收起节点时更新内存状态（仅内存，on_close 时落盘）"""
+        if getattr(self, '_rebuilding', False):
+            return  # 正在 _refresh_tree 重建，忽略
+        # 优先从鼠标点击位置定位节点，回退到当前焦点
+        iid = None
+        try:
+            if event is not None and getattr(event, 'y', None):
+                iid = self._tree.identify_row(event.y)
+        except Exception:
+            iid = None
+        if not iid:
+            iid = self._tree.focus()
+        if not iid:
+            return
+        if opened:
+            self._expanded_ids.add(iid)
+        else:
+            self._expanded_ids.discard(iid)
+
     def _subscribe_events(self):
         self._event_bus.subscribe("outline:tree_changed",
                                   lambda e: (self._refresh_tree(), self._update_stats()))
@@ -1287,20 +1317,24 @@ class OutlinePanel(BasePanel):
         name_entry.bind("<Return>", lambda e: do_create())
 
     def _refresh_tree(self):
-        # ★ v2.2.1: 记录当前展开状态，重建后恢复
-        expanded = self._collect_expanded_ids()
+        # ★ v2.2.1: 优先用内存中的展开状态（含加载/用户交互），兜底收集旧树
+        expanded = self._expanded_ids or self._collect_expanded_ids()
         self._expanded_ids = expanded  # 同步内存状态
-        self._tree.delete(*self._tree.get_children())
-        if not self._project_service.get_current_project():
-            self._expanded_ids = set()
-            return
-        nodes = self._project_service.get_outline_tree()
-        if not nodes:
-            return
-        # 找到根节点
-        roots = [n for n in nodes if n.parent_id is None]
-        for root in sorted(roots, key=lambda n: n.order):
-            self._insert_tree_node("", root, nodes, expanded)
+        self._rebuilding = True       # 抑制展开/收起事件
+        try:
+            self._tree.delete(*self._tree.get_children())
+            if not self._project_service.get_current_project():
+                self._expanded_ids = set()
+                return
+            nodes = self._project_service.get_outline_tree()
+            if not nodes:
+                return
+            # 找到根节点
+            roots = [n for n in nodes if n.parent_id is None]
+            for root in sorted(roots, key=lambda n: n.order):
+                self._insert_tree_node("", root, nodes, expanded)
+        finally:
+            self._rebuilding = False
 
     def _insert_tree_node(self, parent_iid: str, node: OutlineNode,
                           all_nodes: list[OutlineNode],
@@ -1563,7 +1597,6 @@ class OutlinePanel(BasePanel):
                 _expand_children(child)
         for root in self._tree.get_children():
             _expand_children(root)
-        self._save_expanded_state()
 
     def _collapse_all(self):
         """折叠大纲树全部节点（保留一级展开）"""
@@ -1574,7 +1607,6 @@ class OutlinePanel(BasePanel):
                 self._tree.item(iid, open=False)
         for root in self._tree.get_children():
             _collapse_children(root)
-        self._save_expanded_state()
 
     def _filter_tree(self):
         """搜索过滤：高亮匹配节点并展开路径"""
