@@ -185,6 +185,7 @@ class MainWindow:
             self._project_service,
         )
         self._panels["outline"].set_ai_client(self._ai_client)
+        self._panels["outline"].set_config_manager(self._config_manager)
         # ★ v2.0: 新增面板
         self._panels["characters"] = CharacterPanel(
             self._content_frame, self._event_bus, self._logger,

@@ -56,7 +56,7 @@ class BasePanel(ABC):
 class ChatPanel(BasePanel):
     """AI 对话面板 — 含提示词选择、内容勾选、工具调用"""
 
-    # ★ v2.2 内置 Skill 文本
+    # ★ v2.2 内置 Skill 文本（默认值，可在全局配置修改）
     SKILL = (
         "【工作流】全局工作流程\n"
         "【数据来源】当前项目数据库\n"
@@ -66,6 +66,17 @@ class ChatPanel(BasePanel):
         "3. 分析伏笔条目，锁定可能需要删除的伏笔，利用读取工具进行读取。\n"
         "4. 使用伏笔工具，对已有的伏笔进行增删。"
     )
+
+    def _get_skill_text(self) -> str:
+        """从全局配置读取 skill 文本（可修改）"""
+        try:
+            if self._config_manager:
+                cfg = self._config_manager.load_app_config()
+                if getattr(cfg, 'chat_skill_text', '').strip():
+                    return cfg.chat_skill_text
+        except Exception:
+            pass
+        return self.SKILL
 
     def __init__(self, parent, event_bus, logger,
                  ai_client: AIClient, session_manager: SessionManager,
@@ -271,32 +282,50 @@ class ChatPanel(BasePanel):
         # ★ 恢复上次选择的提示词
         self._load_prompt_state()
 
+    def on_close(self):
+        """关闭时保存提示词状态"""
+        self._save_prompt_state()
+
     # ── 提示词持久化 ──
     def _save_prompt_state(self):
-        """保存当前选中的提示词名称到 AppConfig"""
+        """保存当前提示词名称 + 文本框内容到 AppConfig"""
         if not self._config_manager:
             return
         try:
             cfg = self._config_manager.load_app_config()
-            cfg.last_sys_prompt = self._sys_prompt_var.get()
-            cfg.last_add_prompt = self._add_prompt_var.get()
+            cfg.last_sys_prompt_name = self._sys_prompt_var.get()
+            cfg.last_sys_prompt_content = self._sys_prompt_text.get("1.0", "end-1c").strip()
+            cfg.last_add_prompt_name = self._add_prompt_var.get()
+            cfg.last_add_prompt_content = self._add_prompt_text.get("1.0", "end-1c").strip()
             cfg.last_add_enabled = self._add_prompt_enabled.get()
             self._config_manager.save_app_config(cfg)
         except Exception:
             pass
 
     def _load_prompt_state(self):
-        """从 AppConfig 恢复上次选中的提示词"""
+        """从 AppConfig 恢复上次提示词（名称先设置，内容后插入以免被 OptionMenu 回调覆盖）"""
         if not self._config_manager:
             return
         try:
             cfg = self._config_manager.load_app_config()
-            if cfg.last_sys_prompt and cfg.last_sys_prompt != "无":
-                self._on_sys_prompt_selected(cfg.last_sys_prompt)
-            if cfg.last_add_prompt and cfg.last_add_prompt != "无":
-                self._on_add_prompt_selected(cfg.last_add_prompt)
+            # ★ 先设置名称（会触发 OptionMenu 回调清空文本框）
+            sys_name = getattr(cfg, 'last_sys_prompt_name', '')
+            if sys_name:
+                self._sys_prompt_var.set(sys_name)
+            add_name = getattr(cfg, 'last_add_prompt_name', '')
+            if add_name:
+                self._add_prompt_var.set(add_name)
             if hasattr(cfg, 'last_add_enabled'):
                 self._add_prompt_enabled.set(cfg.last_add_enabled)
+            # ★ 然后插入保存的内容（覆盖 OptionMenu 回调写入的内容）
+            sys_content = getattr(cfg, 'last_sys_prompt_content', '')
+            if sys_content:
+                self._sys_prompt_text.delete("1.0", "end")
+                self._sys_prompt_text.insert("1.0", sys_content)
+            add_content = getattr(cfg, 'last_add_prompt_content', '')
+            if add_content:
+                self._add_prompt_text.delete("1.0", "end")
+                self._add_prompt_text.insert("1.0", add_content)
         except Exception:
             pass
 
@@ -704,7 +733,8 @@ class ChatPanel(BasePanel):
 
         # 系统提示词 = 内置 Skill + 用户系统提示词 + 附加提示词
         sys_prompt = self._sys_prompt_text.get("1.0", "end-1c").strip()
-        system_prompt = self.SKILL + "\n\n" + sys_prompt if sys_prompt else self.SKILL
+        skill = self._get_skill_text()
+        system_prompt = skill + "\n\n" + sys_prompt if sys_prompt else skill
         if self._add_prompt_enabled.get():
             add_prompt = self._add_prompt_text.get("1.0", "end-1c").strip()
             if add_prompt:
@@ -938,11 +968,18 @@ class OutlinePanel(BasePanel):
         self._current_node_id: Optional[str] = None
         self._content_modified = False
         self._ai_client = None  # 由 MainWindow 注入
+        self._config_manager = None  # ★ v2.2.1 由 MainWindow 注入
+        self._expanded_ids: set[str] = set()  # ★ v2.2.1 展开状态
+        self._expanded_loaded = False
         super().__init__(parent, event_bus, logger)
 
     def set_ai_client(self, ai_client) -> None:
         """注入 AI 客户端（由 MainWindow 调用）"""
         self._ai_client = ai_client
+
+    def set_config_manager(self, cm) -> None:
+        """注入配置管理器（用于保存展开状态）"""
+        self._config_manager = cm
 
     def _setup_ui(self):
         # 顶部工具栏
@@ -991,6 +1028,9 @@ class OutlinePanel(BasePanel):
         self._tree.bind("<<TreeviewSelect>>", self._on_node_selected)
         self._tree.bind("<Double-1>", self._on_node_rename)
         self._tree.bind("<Button-3>", self._on_tree_right_click)
+        # ★ v2.2.1: 展开/收起事件实时保存状态
+        self._tree.bind("<<TreeviewOpen>>", lambda e: self._save_expanded_state())
+        self._tree.bind("<<TreeviewClose>>", lambda e: self._save_expanded_state())
 
         # 右键菜单
         self._tree_menu = tk.Menu(self.frame, tearoff=0)
@@ -1143,11 +1183,53 @@ class OutlinePanel(BasePanel):
         self._event_bus.subscribe("project:switched", lambda e: self._refresh_all())
 
     def on_show(self):
+        # ★ v2.2.1: 加载上次展开状态（仅首次进入）
+        if not self._expanded_loaded:
+            self._load_expanded_state()
+            self._expanded_loaded = True
         self._refresh_all()
         self._update_stats()
 
     def on_close(self):
         self._auto_save_if_dirty()
+        self._save_expanded_state()
+
+    # ★ v2.2.1: 展开状态管理
+    def _collect_expanded_ids(self) -> set[str]:
+        """收集当前树中所有展开的节点 ID"""
+        ids: set[str] = set()
+        for iid in self._tree.get_children(""):
+            self._collect_expanded_recursive(iid, ids)
+        return ids
+
+    def _collect_expanded_recursive(self, iid: str, acc: set[str]):
+        if self._tree.item(iid, "open"):
+            acc.add(iid)
+        for child in self._tree.get_children(iid):
+            self._collect_expanded_recursive(child, acc)
+
+    def _save_expanded_state(self):
+        """保存当前项目的展开节点到 AppConfig"""
+        try:
+            if not self._config_manager:
+                return
+            expanded = self._collect_expanded_ids()
+            cfg = self._config_manager.load_app_config()
+            cfg.outline_expanded_ids = sorted(expanded)
+            self._config_manager.save_app_config(cfg)
+        except Exception:
+            pass
+
+    def _load_expanded_state(self):
+        """从 AppConfig 恢复展开状态"""
+        try:
+            if not self._config_manager:
+                return
+            cfg = self._config_manager.load_app_config()
+            ids = getattr(cfg, 'outline_expanded_ids', []) or []
+            self._expanded_ids = set(ids) if isinstance(ids, list) else set()
+        except Exception:
+            self._expanded_ids = set()
 
     def _refresh_all(self):
         self._refresh_project_list()
@@ -1205,8 +1287,12 @@ class OutlinePanel(BasePanel):
         name_entry.bind("<Return>", lambda e: do_create())
 
     def _refresh_tree(self):
+        # ★ v2.2.1: 记录当前展开状态，重建后恢复
+        expanded = self._collect_expanded_ids()
+        self._expanded_ids = expanded  # 同步内存状态
         self._tree.delete(*self._tree.get_children())
         if not self._project_service.get_current_project():
+            self._expanded_ids = set()
             return
         nodes = self._project_service.get_outline_tree()
         if not nodes:
@@ -1214,24 +1300,29 @@ class OutlinePanel(BasePanel):
         # 找到根节点
         roots = [n for n in nodes if n.parent_id is None]
         for root in sorted(roots, key=lambda n: n.order):
-            self._insert_tree_node("", root, nodes)
+            self._insert_tree_node("", root, nodes, expanded)
 
     def _insert_tree_node(self, parent_iid: str, node: OutlineNode,
-                          all_nodes: list[OutlineNode]):
+                          all_nodes: list[OutlineNode],
+                          expanded: set[str] | None = None):
         level_icon = {1: "📗", 2: "📘", 3: "📙", 4: "📕", 5: "📄"}.get(node.level.value, "📄")
         status_icon = {
             NodeStatus.COMPLETED: "✓", NodeStatus.IN_PROGRESS: "●",
             NodeStatus.TODO: "○", NodeStatus.IGNORED: "⊘",
         }.get(node.status, "○")
+        # ★ v2.2.1: 根据展开状态决定节点是否展开
+        is_open = True
+        if expanded is not None:
+            is_open = node.node_id in expanded
         iid = self._tree.insert(
             parent_iid, "end", iid=node.node_id,
             text=f"{level_icon} {status_icon} {node.title}",
-            open=True,
+            open=is_open,
         )
         for cid in node.children_ids:
             child = next((n for n in all_nodes if n.node_id == cid), None)
             if child:
-                self._insert_tree_node(iid, child, all_nodes)
+                self._insert_tree_node(iid, child, all_nodes, expanded)
 
     def _on_node_selected(self, event):
         selection = self._tree.selection()
@@ -1472,6 +1563,7 @@ class OutlinePanel(BasePanel):
                 _expand_children(child)
         for root in self._tree.get_children():
             _expand_children(root)
+        self._save_expanded_state()
 
     def _collapse_all(self):
         """折叠大纲树全部节点（保留一级展开）"""
@@ -1482,6 +1574,7 @@ class OutlinePanel(BasePanel):
                 self._tree.item(iid, open=False)
         for root in self._tree.get_children():
             _collapse_children(root)
+        self._save_expanded_state()
 
     def _filter_tree(self):
         """搜索过滤：高亮匹配节点并展开路径"""
@@ -2354,6 +2447,30 @@ class ConfigPanel(BasePanel):
         days_spin.pack(anchor="w", padx=24)
         days_spin.bind("<FocusOut>", lambda e: self._save_global_settings())
 
+        ttk.Separator(global_tab, orient="horizontal").pack(fill="x", padx=24, pady=8)
+
+        # ★ v2.2.1: 状态栏提示词模板（可修改）
+        tk.Label(global_tab, text="状态栏 AI 提示词模板（{project}/{data} 等占位符会被替换）:", bg="#ffffff",
+                 font=("Microsoft YaHei", 10)).pack(anchor="w", padx=24, pady=(8, 2))
+        self._global_status_prompt = tk.Text(global_tab, height=6, font=("Microsoft YaHei", 9),
+                                             wrap="word")
+        self._global_status_prompt.insert("1.0", getattr(cfg, 'status_prompt_template', ''))
+        self._global_status_prompt.pack(fill="x", padx=24, pady=2)
+
+        ttk.Separator(global_tab, orient="horizontal").pack(fill="x", padx=24, pady=8)
+
+        # ★ v2.2.1: 对话 Skill 文本（可修改）
+        tk.Label(global_tab, text="对话 Skill 文本（内置工作流，自动附加到系统提示词）:", bg="#ffffff",
+                 font=("Microsoft YaHei", 10)).pack(anchor="w", padx=24, pady=(8, 2))
+        self._global_skill_text = tk.Text(global_tab, height=6, font=("Microsoft YaHei", 9),
+                                          wrap="word")
+        self._global_skill_text.insert("1.0", getattr(cfg, 'chat_skill_text', ''))
+        self._global_skill_text.pack(fill="x", padx=24, pady=2)
+
+        tk.Button(global_tab, text="💾 保存全部设置", command=self._save_global_settings,
+                  font=("Microsoft YaHei", 11), bg="#0078d4", fg="white",
+                  relief="flat", padx=16, pady=4).pack(anchor="w", padx=24, pady=12)
+
     def on_show(self):
         self._refresh_source_list()
 
@@ -2496,6 +2613,9 @@ class ConfigPanel(BasePanel):
             cfg.max_tool_rounds = int(self._global_max_rounds.get())
         except ValueError:
             pass
+        # ★ v2.2.1: 保存可配置模板
+        cfg.status_prompt_template = self._global_status_prompt.get("1.0", "end-1c").strip()
+        cfg.chat_skill_text = self._global_skill_text.get("1.0", "end-1c").strip()
         self._config_manager.save_app_config(cfg)
 
     def _update_temp_label(self, val):
@@ -3133,6 +3253,18 @@ class ForeshadowPanel(BasePanel):
 class StatusPanel(BasePanel):
     """创作状态面板 — 展示进度 + AI 一键生成"""
 
+    # ★ v2.2.1 状态提示词默认模板（可在全局配置修改）
+    STATUS_PROMPT_DEFAULT = (
+        "你是一位资深网文编辑。以下是作者当前的创作进度，请用 200~400 字给出针对性建议：\n\n"
+        "项目: {project}\n"
+        "大纲节点: {node_count} | 正文: {chapter_count}章 ({completed_count}完成) | 总字数: {word_count:,}\n\n"
+        "{data}\n\n"
+        "请直接输出（不要客套、不要标题、不要列表格式）：\n"
+        "1. 当前进度的卡点或薄弱环节是什么？\n"
+        "2. 下一步最应该做什么（给 1~2 个具体方向）？\n"
+        "3. 用一句话总结当前创作状态。"
+    )
+
     def __init__(self, parent, event_bus, logger, project_service: ProjectService):
         self._project_service = project_service
         self._ai_client: "AIClient | None" = None
@@ -3330,17 +3462,30 @@ class StatusPanel(BasePanel):
 
             full_data = "\n".join(data_parts)
 
-            # ★ 精简提示词：针对作者给出方向性建议，限制字数
-            prompt = (
-                "你是一位资深网文编辑。以下是作者当前的创作进度，请用 200~400 字给出针对性建议：\n\n"
-                f"项目: {ps.get_current_project()}\n"
-                f"大纲节点: {len(l1_l4)} | 正文: {len(l5_nodes)}章 ({completed_l5}完成) | 总字数: {total_words:,}\n\n"
-                f"{full_data}\n\n"
-                "请直接输出（不要客套、不要标题、不要列表格式）：\n"
-                "1. 当前进度的卡点或薄弱环节是什么？\n"
-                "2. 下一步最应该做什么（给 1~2 个具体方向）？\n"
-                "3. 用一句话总结当前创作状态。"
-            )
+            # ★ 使用全局可配置的状态提示词模板
+            template = self.STATUS_PROMPT_DEFAULT
+            try:
+                if self._config_manager:
+                    cfg = self._config_manager.load_app_config()
+                    t = getattr(cfg, 'status_prompt_template', '')
+                    if t.strip():
+                        template = t
+            except Exception:
+                pass
+            prompt = template
+            # 安全替换占位符（缺占位符也不报错）
+            try:
+                prompt = template.format(
+                    project=ps.get_current_project() or "",
+                    node_count=len(l1_l4),
+                    chapter_count=len(l5_nodes),
+                    completed_count=completed_l5,
+                    word_count=total_words,
+                    data=full_data,
+                )
+            except Exception:
+                # 模板不含标准占位符时，直接拼接数据
+                prompt = template + "\n\n" + full_data
 
             messages = [ChatMessage("user", prompt)]
 

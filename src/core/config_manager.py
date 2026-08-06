@@ -80,7 +80,7 @@ class AISourceConfig:
 @dataclass
 class AppConfig:
     """应用全局配置"""
-    version: str = "2.2.1"
+    version: str = "0.2.0"
     language: str = "zh-CN"
     window_width: int = 1200
     window_height: int = 700
@@ -90,9 +90,33 @@ class AppConfig:
     last_project: str = ""
     tool_enabled: bool = False
     max_tool_rounds: int = 5          # AI 工具调用最大轮数
-    last_sys_prompt: str = ""         # ★ 上次系统提示词名称
-    last_add_prompt: str = ""         # ★ 上次附加提示词名称
-    last_add_enabled: bool = False    # ★ 附加提示词启用状态
+    # ★ 提示词状态（名称 + 内容，内容支持手动输入）
+    last_sys_prompt_name: str = ""
+    last_sys_prompt_content: str = ""
+    last_add_prompt_name: str = ""
+    last_add_prompt_content: str = ""
+    last_add_enabled: bool = False
+    # ★ v2.2.1 可配置模板
+    status_prompt_template: str = (
+        "你是一位资深网文编辑。以下是作者当前的创作进度，请用 200~400 字给出针对性建议：\n\n"
+        "项目: {project}\n"
+        "大纲节点: {node_count} | 正文: {chapter_count}章 ({completed_count}完成) | 总字数: {word_count:,}\n\n"
+        "{data}\n\n"
+        "请直接输出（不要客套、不要标题、不要列表格式）：\n"
+        "1. 当前进度的卡点或薄弱环节是什么？\n"
+        "2. 下一步最应该做什么（给 1~2 个具体方向）？\n"
+        "3. 用一句话总结当前创作状态。"
+    )
+    chat_skill_text: str = (
+        "【工作流】全局工作流程\n"
+        "【数据来源】当前项目数据库\n"
+        "【执行步骤】\n"
+        "1. 分析用户指令，将需要用到的大纲文档、设定信息、角色信息、伏笔信息，利用统一读取工具一口气批量读取。\n"
+        "2. 执行用户指令进行内容生成。\n"
+        "3. 分析伏笔条目，锁定可能需要删除的伏笔，利用读取工具进行读取。\n"
+        "4. 使用伏笔工具，对已有的伏笔进行增删。"
+    )
+    outline_expanded_ids: list[str] = field(default_factory=list)  # ★ 大纲展开节点
     ai_sources: list[AISourceConfig] = field(default_factory=list)
 
     @staticmethod
@@ -111,9 +135,14 @@ class AppConfig:
             "last_project": self.last_project,
             "tool_enabled": self.tool_enabled,
             "max_tool_rounds": self.max_tool_rounds,
-            "last_sys_prompt": self.last_sys_prompt,
-            "last_add_prompt": self.last_add_prompt,
+            "last_sys_prompt_name": self.last_sys_prompt_name,
+            "last_sys_prompt_content": self.last_sys_prompt_content,
+            "last_add_prompt_name": self.last_add_prompt_name,
+            "last_add_prompt_content": self.last_add_prompt_content,
             "last_add_enabled": self.last_add_enabled,
+            "status_prompt_template": self.status_prompt_template,
+            "chat_skill_text": self.chat_skill_text,
+            "outline_expanded_ids": self.outline_expanded_ids,
             "ai_sources": [s.to_dict() for s in self.ai_sources],
         }
 
@@ -131,9 +160,14 @@ class AppConfig:
             last_project=d.get("last_project", ""),
             tool_enabled=d.get("tool_enabled", False),
             max_tool_rounds=d.get("max_tool_rounds", 5),
-            last_sys_prompt=d.get("last_sys_prompt", ""),
-            last_add_prompt=d.get("last_add_prompt", ""),
+            last_sys_prompt_name=d.get("last_sys_prompt_name", ""),
+            last_sys_prompt_content=d.get("last_sys_prompt_content", ""),
+            last_add_prompt_name=d.get("last_add_prompt_name", ""),
+            last_add_prompt_content=d.get("last_add_prompt_content", ""),
             last_add_enabled=d.get("last_add_enabled", False),
+            status_prompt_template=d.get("status_prompt_template", AppConfig.status_prompt_template),
+            chat_skill_text=d.get("chat_skill_text", AppConfig.chat_skill_text),
+            outline_expanded_ids=d.get("outline_expanded_ids", []),
             ai_sources=sources,
         )
 
