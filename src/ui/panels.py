@@ -1170,24 +1170,18 @@ class ChatPanel(BasePanel):
         align = tk.Frame(outer, bg="#f5f6fa")
         align.pack(anchor="e" if is_user else "w", fill="x")
 
-        # 气泡宽度：消息区 72%（上限 720px）
-        try:
-            canvas_w = max(self._msg_canvas.winfo_width(), 400)
-        except Exception:
-            canvas_w = 600
-        bubble_w = min(int(canvas_w * 0.72), 720)
+        # 气泡：自然包裹内容（高度自适应，宽度由正文 Text 控制）
         bubble = tk.Frame(align, bg=bubble_color, padx=12, pady=8,
-                          width=bubble_w, highlightthickness=1,
+                          highlightthickness=1,
                           highlightbackground="#dde1e6" if not is_user else bubble_color)
-        bubble.pack_propagate(False)
         bubble.pack(side="right" if is_user else "left")
 
         # 角色标签
         tk.Label(bubble, text="👤 你" if is_user else "🤖 AI",
                  font=("Microsoft YaHei", 8, "bold"),
                  bg=bubble_color, fg=label_color, anchor="w").pack(fill="x", pady=(0, 2))
-        # 正文（只读 Text，支持长文本自动换行）
-        body = tk.Text(bubble, wrap="word", font=("Microsoft YaHei", 11),
+        # 正文（只读 Text，宽度约 45 列控制气泡宽度，长文本自动换行）
+        body = tk.Text(bubble, wrap="word", width=45, font=("Microsoft YaHei", 11),
                        bg=bubble_color, fg=text_color, borderwidth=0,
                        highlightthickness=0, padx=2, pady=2)
         body.insert("1.0", content)
