@@ -51,6 +51,79 @@ class BasePanel(ABC):
         """面板关闭时调用"""
 
 
+# ==================== 深度思考弹窗 ====================
+
+class ReasoningWindow:
+    """深度思考弹窗 — 流式显示 AI 的 reasoning_content（v2.2.2）
+
+    在收到第一个 reasoning chunk 时创建，实时追加内容；
+    思考结束后标记完成，用户可手动关闭。
+    """
+
+    def __init__(self, parent: tk.Widget, title: str = "🧠 深度思考"):
+        self._win = tk.Toplevel(parent)
+        self._win.title(title)
+        self._win.geometry("560x420")
+        self._win.minsize(360, 240)
+        # 置顶于主窗口之上，方便边看思考边等正文
+        try:
+            self._win.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        header = tk.Frame(self._win, bg="#fff7e6")
+        header.pack(fill="x")
+        tk.Label(header, text="🧠 深度思考进行中...", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#fff7e6", fg="#b8860b").pack(side="left", padx=8, pady=4)
+        tk.Button(header, text="✕ 关闭", command=self.close,
+                  font=("Microsoft YaHei", 9), relief="flat", padx=6).pack(side="right", padx=6, pady=2)
+
+        self._text = tk.Text(self._win, wrap="word", font=("Microsoft YaHei", 10),
+                             bg="#f8f9fa", fg="#555555", padx=10, pady=8, borderwidth=0)
+        self._text.pack(fill="both", expand=True)
+        scrollbar = tk.Scrollbar(self._win, command=self._text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._text.config(yscrollcommand=scrollbar.set)
+        self._finished = False
+
+    def append(self, text: str) -> None:
+        """追加一段思考内容（主线程调用）"""
+        if self._finished:
+            return
+        self._text.config(state="normal")
+        self._text.insert("end", text)
+        self._text.see("end")
+        self._text.config(state="disabled")
+
+    def finish(self) -> None:
+        """思考结束标记"""
+        if self._finished:
+            return
+        self._finished = True
+        try:
+            self._win.attributes("-topmost", False)
+        except Exception:
+            pass
+        # 更新头部为完成态
+        for child in self._win.winfo_children():
+            if isinstance(child, tk.Frame):
+                for c in child.winfo_children():
+                    if isinstance(c, tk.Label):
+                        c.config(text="🧠 深度思考完成", fg="#2e8b57")
+
+    def is_alive(self) -> bool:
+        try:
+            return bool(self._win.winfo_exists())
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        try:
+            self._win.destroy()
+        except Exception:
+            pass
+
+
 # ==================== ChatPanel ====================
 
 class ChatPanel(BasePanel):
@@ -91,6 +164,11 @@ class ChatPanel(BasePanel):
         self._response_buffer = ""
         self._is_streaming = False
         self._ai_prefix_inserted = False    # AI 前缀是否已插入
+        # ★ v2.2.2 深度思考
+        self._reasoning_window: Optional[ReasoningWindow] = None
+        self._current_reasoning = ""        # 本次回复的思考内容缓存
+        self._pending_tool_calls: list[dict] = []  # 本次回复涉及的工具调用
+        self._collapsible_seq = 0           # 折叠标记行自增序号
         # 内容勾选状态: {node_id: (title, content, checked)}
         self._content_checkboxes: dict[str, tk.BooleanVar] = {}
         self._selected_content: list[str] = []  # 选中的完整文本
@@ -266,6 +344,9 @@ class ChatPanel(BasePanel):
         self._event_bus.subscribe("ai:response_error", self._on_response_error)
         self._event_bus.subscribe("ai:tool_call", self._on_tool_call)
         self._event_bus.subscribe("ai:tool_result", self._on_tool_result)
+        # ★ v2.2.2 深度思考事件
+        self._event_bus.subscribe("ai:reasoning_chunk", self._on_reasoning_chunk)
+        self._event_bus.subscribe("ai:reasoning_end", self._on_reasoning_end)
         self._event_bus.subscribe("project:switched", self._on_project_changed)
 
     def on_show(self):
@@ -791,6 +872,9 @@ class ChatPanel(BasePanel):
         self._response_buffer = ""
         self._is_streaming = True
         self._ai_prefix_inserted = False
+        # ★ v2.2.2 重置深度思考状态（弹窗在收到首个 chunk 时懒创建）
+        self._current_reasoning = ""
+        self._pending_tool_calls = []
         self._send_btn.config(text="⏹ 停止", bg="#d32f2f", command=self._stop_streaming)
 
         use_tools = self._tool_enabled.get() and self._tool_registry is not None
@@ -831,32 +915,64 @@ class ChatPanel(BasePanel):
         self._msg_text.see("end")
         self._msg_text.config(state="disabled")
 
+    # ★ v2.2.2 深度思考流式处理
+    def _on_reasoning_chunk(self, event):
+        text = event.data.get("text", "")
+        self._current_reasoning += text
+        # 懒创建弹窗：收到第一个 chunk 才打开
+        if self._reasoning_window is None or not self._reasoning_window.is_alive():
+            self._reasoning_window = ReasoningWindow(self.frame)
+        self._reasoning_window.append(text)
+
+    def _on_reasoning_end(self, event):
+        if self._reasoning_window is not None and self._reasoning_window.is_alive():
+            self._reasoning_window.finish()
+
     def _on_tool_call(self, event):
         tool = event.data.get("tool", "?")
         args = event.data.get("args", {})
+        # ★ v2.2.2 记录到本次回复的工具调用列表（随 assistant 消息保存）
+        self._pending_tool_calls.append({
+            "tool": tool,
+            "args": args,
+            "hallucinated": bool(event.data.get("hallucinated", False)),
+        })
+        # 折叠显示（右键查看详情）
+        action = "📝插入" if tool == "insert_text_at" else ("✏修改" if tool == "replace_text_at" else f"调用工具: {tool}")
         if tool in ("insert_text_at", "replace_text_at"):
-            action = "📝插入" if tool == "insert_text_at" else "✏修改"
-            loc = f"行{args.get('line','?')}列{args.get('col','?')}"
-            text_preview = str(args.get("text", ""))[:30]
-            self._append_message("system", f"{action} {loc}: {text_preview}...")
+            loc = f"行{args.get('line', '?')}列{args.get('col', '?')}"
+            detail = json.dumps(args, ensure_ascii=False)
+            self._append_collapsible("🔧", f"{action} {loc}", detail)
         else:
-            self._append_message("system", f"🔧 AI 调用工具: {tool}({json.dumps(args, ensure_ascii=False)[:80]})")
+            self._append_collapsible("🔧", action, json.dumps(args, ensure_ascii=False))
+        # 保存 tool 消息（与旧格式兼容）
         if self._current_session_id:
             self._session_manager.add_message(self._current_session_id, "tool",
                 json.dumps({"action": "call", "tool": tool, "args": args}, ensure_ascii=False))
 
     def _on_tool_result(self, event):
-        self._append_message("system", f"✅ 工具执行完成: {event.data.get('tool', '?')}")
+        # ★ v2.2.2 折叠显示工具结果（右键查看完整内容）
+        tool = event.data.get("tool", "?")
+        result = event.data.get("result", "")
+        self._append_collapsible("✅", f"工具结果: {tool}", str(result)[:2000])
         if self._current_session_id:
-            result = event.data.get("result", "")
             self._session_manager.add_message(self._current_session_id, "tool",
-                json.dumps({"action": "result", "tool": event.data.get("tool", ""),
+                json.dumps({"action": "result", "tool": tool,
                             "result": str(result)[:500]}, ensure_ascii=False))
 
     def _on_response_end(self, event):
         if self._current_session_id:
             full = event.data.get("full_text", self._response_buffer)
-            self._session_manager.add_message(self._current_session_id, "assistant", full)
+            # ★ v2.2.2 保存深度思考与工具调用元数据
+            meta = {}
+            reasoning = event.data.get("reasoning") or self._current_reasoning
+            if reasoning:
+                meta["reasoning"] = reasoning
+            if self._pending_tool_calls:
+                meta["tool_calls"] = self._pending_tool_calls
+            self._session_manager.add_message(
+                self._current_session_id, "assistant", full,
+                meta=meta if meta else None)
 
     def _on_response_error(self, event):
         self._append_message("system", f"❌ 错误: {event.data.get('error', '未知错误')}")
@@ -882,15 +998,72 @@ class ChatPanel(BasePanel):
             self._input_text.insert("1.0", last_user)
             self._on_send()
 
-    def _append_message(self, role: str, content: str):
+    def _append_message(self, role: str, content: str, meta: dict | None = None):
         # 隐藏占位提示
         if hasattr(self, '_msg_placeholder') and self._msg_placeholder.winfo_ismapped():
             self._msg_placeholder.place_forget()
+
+        # ★ v2.2.2 tool 消息折叠显示（历史回顾时）
+        if role == "tool":
+            try:
+                data = json.loads(content)
+                action = data.get("action")
+                if action == "call":
+                    self._append_collapsible("🔧", f"调用工具: {data.get('tool', '?')}",
+                                             json.dumps(data.get("args", {}), ensure_ascii=False))
+                    return
+                if action == "result":
+                    self._append_collapsible("✅", f"工具结果: {data.get('tool', '?')}",
+                                             str(data.get("result", "")))
+                    return
+            except Exception:
+                pass  # 非 JSON 格式，按普通消息显示
+
         self._msg_text.config(state="normal")
         prefix = {"user": "👤 你", "assistant": "🤖 AI", "system": "⚙ 系统"}.get(role, role)
         self._msg_text.insert("end", f"\n\n{prefix}: {content}")
         self._msg_text.see("end")
         self._msg_text.config(state="disabled")
+
+        # ★ v2.2.2 assistant 消息附带 reasoning / tool_calls → 折叠展示
+        if role == "assistant" and meta:
+            reasoning = meta.get("reasoning")
+            if reasoning:
+                self._append_collapsible("🧠", "深度思考", reasoning)
+            for tc in (meta.get("tool_calls") or []):
+                tool_name = tc.get("tool", "?")
+                args = tc.get("args", {})
+                self._append_collapsible("🔧", f"调用工具: {tool_name}",
+                                         json.dumps(args, ensure_ascii=False))
+
+    def _append_collapsible(self, icon: str, title: str, detail: str):
+        """插入折叠标记行 — 灰色底纹 + [右键查看]；右键弹出完整详情"""
+        self._msg_text.config(state="normal")
+        start = self._msg_text.index("end-1c")
+        self._msg_text.insert("end", f"\n\n⚙ {icon} {title}  [💡 右键查看]")
+        end = self._msg_text.index("end-1c")
+        self._collapsible_seq += 1
+        tag = f"col_{self._collapsible_seq}"
+        self._msg_text.tag_add(tag, start, end)
+        self._msg_text.tag_configure(tag, background="#f0f4f8", foreground="#555555",
+                                     font=("Microsoft YaHei", 9))
+        self._msg_text.tag_bind(tag, "<Button-3>",
+                                lambda e, t=title, d=detail: self._show_detail_popup(e, t, d))
+        self._msg_text.see("end")
+        self._msg_text.config(state="disabled")
+
+    def _show_detail_popup(self, event, title: str, detail: str):
+        """右键折叠标记行 → 弹出详细内容窗口"""
+        win = tk.Toplevel(self.frame)
+        win.title(title)
+        win.geometry("520x400")
+        win.minsize(360, 240)
+        tk.Label(win, text=title, font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f0f4f8").pack(fill="x", padx=8, pady=6)
+        text = tk.Text(win, wrap="word", font=("Microsoft YaHei", 10))
+        text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        text.insert("1.0", detail)
+        text.config(state="disabled")
 
     def _new_session(self):
         s = self._session_manager.create_session()
@@ -900,6 +1073,10 @@ class ChatPanel(BasePanel):
         self._msg_text.config(state="disabled")
         self._show_placeholder()
         self._refresh_session_list()
+        # ★ v2.2.2 清理深度思考弹窗
+        if self._reasoning_window is not None and self._reasoning_window.is_alive():
+            self._reasoning_window.close()
+            self._reasoning_window = None
 
     def _delete_session(self):
         if self._current_session_id:
@@ -910,6 +1087,10 @@ class ChatPanel(BasePanel):
             self._msg_text.config(state="disabled")
             self._show_placeholder()
             self._refresh_session_list()
+            # ★ v2.2.2 清理深度思考弹窗
+            if self._reasoning_window is not None and self._reasoning_window.is_alive():
+                self._reasoning_window.close()
+                self._reasoning_window = None
 
     def _refresh_session_list(self):
         sessions = self._session_manager.list_sessions()
@@ -921,17 +1102,48 @@ class ChatPanel(BasePanel):
         self._session_var.set("选择对话" if sessions else "新对话")
 
     def _switch_session(self, session_id: str):
+        """切换会话 — 后台线程读取 + 主线程分批渲染（v2.2.2 防卡顿）"""
         self._current_session_id = session_id
-        s = self._session_manager.get_session(session_id)
+        # 关闭残留的深度思考弹窗
+        if self._reasoning_window is not None and self._reasoning_window.is_alive():
+            self._reasoning_window.close()
+            self._reasoning_window = None
+        # 立即清空并显示加载状态
         self._msg_text.config(state="normal")
         self._msg_text.delete("1.0", "end")
-        if s:
-            for m in s.messages:
-                self._append_message(m["role"], m["content"])
         self._msg_text.config(state="disabled")
-        if not s or not s.messages:
-            self._show_placeholder()
-        self._session_var.set(s.title[:20] if s else "对话")
+        self._append_message("system", "⏳ 正在加载历史会话...")
+
+        def load():
+            try:
+                s = self._session_manager.get_session(session_id)
+                msgs = list(s.messages) if s else []
+                title = s.title if s else ""
+            except Exception:
+                msgs, title = [], ""
+            self.frame.after(0, lambda: self._render_history_batch(session_id, msgs, title, 0))
+
+        import threading
+        threading.Thread(target=load, daemon=True).start()
+
+    def _render_history_batch(self, session_id: str, msgs: list, title: str, index: int):
+        """分批渲染历史消息（每次 10 条，逐批 after 调度，避免 UI 卡顿）"""
+        # 用户已切换到其他会话 → 放弃本次渲染
+        if self._current_session_id != session_id:
+            return
+        if index == 0:
+            self._msg_text.config(state="normal")
+            self._msg_text.delete("1.0", "end")
+            self._msg_text.config(state="disabled")
+        batch = msgs[index:index + 10]
+        for m in batch:
+            self._append_message(m.get("role", "system"), m.get("content", ""), meta=m)
+        if index + 10 < len(msgs):
+            self.frame.after(10, lambda: self._render_history_batch(session_id, msgs, title, index + 10))
+        else:
+            self._session_var.set(title[:20] if title else "对话")
+            if not msgs:
+                self._show_placeholder()
 
     def _show_placeholder(self):
         if hasattr(self, '_msg_placeholder') and not self._msg_placeholder.winfo_ismapped():
@@ -2428,6 +2640,12 @@ class ConfigPanel(BasePanel):
         self._max_tokens_scale.set(2048)
         self._max_tokens_scale.pack(fill="x", padx=16)
 
+        # ★ v2.2.2: 支持深度思考（reasoning_content）
+        self._reasoning_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(right_frame, text="🧠 支持深度思考（流式显示 reasoning_content）",
+                       variable=self._reasoning_var, bg="#ffffff",
+                       font=("Microsoft YaHei", 10)).pack(anchor="w", padx=16, pady=(8, 0))
+
         # 按钮
         btn_frame_r = tk.Frame(right_frame, bg="#ffffff")
         btn_frame_r.pack(fill="x", padx=16, pady=12)
@@ -2534,6 +2752,7 @@ class ConfigPanel(BasePanel):
         self._temp_scale.set(int(source.temperature * 100))
         self._top_p_scale.set(int(source.top_p * 100))
         self._max_tokens_scale.set(source.max_tokens)
+        self._reasoning_var.set(getattr(source, "supports_reasoning", False))
 
     def _add_source(self):
         self._clear_form()
@@ -2557,6 +2776,7 @@ class ConfigPanel(BasePanel):
             temperature=self._temp_scale.get() / 100,
             top_p=self._top_p_scale.get() / 100,
             max_tokens=int(self._max_tokens_scale.get()),
+            supports_reasoning=self._reasoning_var.get(),
         )
 
         if self._current_source_name and self._current_source_name != name:

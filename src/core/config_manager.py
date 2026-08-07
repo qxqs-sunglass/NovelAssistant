@@ -52,6 +52,7 @@ class AISourceConfig:
     top_p: float = 0.9
     max_tokens: int = 2048
     extra_headers: dict = field(default_factory=dict)
+    supports_reasoning: bool = False        # ★ v2.2.2 是否支持深度思考（reasoning_content）
 
     def to_dict(self) -> dict:
         return {
@@ -62,6 +63,7 @@ class AISourceConfig:
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_tokens": self.max_tokens,
+            "supports_reasoning": self.supports_reasoning,
         }
 
     @classmethod
@@ -74,13 +76,14 @@ class AISourceConfig:
             temperature=d.get("temperature", 1.0),
             top_p=d.get("top_p", 0.9),
             max_tokens=d.get("max_tokens", 2048),
+            supports_reasoning=d.get("supports_reasoning", False),
         )
 
 
 @dataclass
 class AppConfig:
     """应用全局配置"""
-    version: str = "0.2.0"
+    version: str = "2.2.2"
     language: str = "zh-CN"
     window_width: int = 1200
     window_height: int = 700

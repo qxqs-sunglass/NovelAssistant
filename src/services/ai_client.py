@@ -353,6 +353,7 @@ class ChatMessage:
     """对话消息"""
     role: str           # "system" | "user" | "assistant"
     content: str        # 消息内容
+    reasoning: str = ""  # ★ v2.2.2 深度思考内容（assistant 消息可选）
 
 
 @dataclass
@@ -562,8 +563,18 @@ class AIClient:
             )
 
             full_text = ""
+            full_reasoning = ""
             for chunk in stream:
                 delta = chunk.choices[0].delta
+                # ★ v2.2.2: 深度思考内容（如 DeepSeek R1 / o1 的 reasoning_content）
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    full_reasoning += reasoning
+                    self._event_bus.publish(
+                        "ai:reasoning_chunk",
+                        {"text": reasoning},
+                        "AIClient",
+                    )
                 if delta.content:
                     text = delta.content
                     full_text += text
@@ -575,9 +586,15 @@ class AIClient:
                     yield text
 
             # 流结束
+            if full_reasoning:
+                self._event_bus.publish(
+                    "ai:reasoning_end",
+                    {"full_reasoning": full_reasoning},
+                    "AIClient",
+                )
             self._event_bus.publish(
                 "ai:response_end",
-                {"full_text": full_text, "model": self._model},
+                {"full_text": full_text, "model": self._model, "reasoning": full_reasoning},
                 "AIClient",
             )
 
@@ -629,6 +646,7 @@ class AIClient:
             raise AIClientError("模型名未设置，请在配置中填写模型名称", "not_configured")
 
         full_text = ""
+        full_reasoning = ""  # ★ v2.2.2 深度思考内容（跨轮次累积）
         for _round in range(max_rounds):
             # 每轮都发送 tool definitions。
             # DeepSeek V4 的 DSML tool-calling 是有状态的：
@@ -652,6 +670,16 @@ class AIClient:
                 round_text = ""
                 for chunk in response:
                     delta = chunk.choices[0].delta
+
+                    # ★ v2.2.2: 深度思考内容
+                    reasoning = getattr(delta, "reasoning_content", None)
+                    if reasoning:
+                        full_reasoning += reasoning
+                        self._event_bus.publish(
+                            "ai:reasoning_chunk",
+                            {"text": reasoning},
+                            "AIClient",
+                        )
 
                     # 文本块
                     if delta.content:
@@ -805,9 +833,15 @@ class AIClient:
                         continue  # 继续下一轮
 
                 # 纯文本回复，完成
+                if full_reasoning:
+                    self._event_bus.publish(
+                        "ai:reasoning_end",
+                        {"full_reasoning": full_reasoning},
+                        "AIClient",
+                    )
                 self._event_bus.publish(
                     "ai:response_end",
-                    {"full_text": full_text, "model": self._model},
+                    {"full_text": full_text, "model": self._model, "reasoning": full_reasoning},
                     "AIClient",
                 )
                 yield {"type": "done", "full_text": full_text}

@@ -173,23 +173,23 @@ class SessionManager:
     # ==================== 消息管理 ====================
 
     def add_message(self, session_id: str, role: str, content: str,
-                     meta: Optional[dict] = None) -> None:
+                    meta: dict | None = None) -> None:
         """向会话添加一条消息
 
         Args:
             session_id: 会话 ID
-            role: "user" | "assistant" | "system" | "tool"
+            role: "user" | "assistant" | "system"
             content: 消息内容
-            meta: 可选元数据（如 refs 引用列表）
+            meta: ★ v2.2.2 附加元数据（reasoning 深度思考、tool_calls 工具调用等）
         """
         session = self.get_session(session_id)
         if session is None:
             self._logger.log(f"会话不存在: {session_id}", "SessionManager", "ERROR")
             return
 
-        msg = {"role": role, "content": content}
+        msg: dict = {"role": role, "content": content}
         if meta:
-            msg["meta"] = meta
+            msg.update(meta)
         session.messages.append(msg)
 
         # 自动标题：取第一条用户消息的前 N 字符
