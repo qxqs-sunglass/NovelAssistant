@@ -25,6 +25,64 @@ from src.services.project_service import (
 )
 
 
+# ==================== 弹窗约束工具 ★ v2.3 ====================
+
+def _root_of(widget) -> Optional[tk.Tk]:
+    """获取任意控件的顶层窗口"""
+    try:
+        return widget.winfo_toplevel()
+    except Exception:
+        return None
+
+
+def _dialog_toplevel(parent, title: str, width: int = 520, height: int = 400,
+                     modal: bool = True) -> tk.Toplevel:
+    """创建受约束的对话框：transient 主窗口 + 模态 + 居中 + 无任务栏图标
+
+    v2.3: 所有弹窗限制在软件页面中（跟随主窗口、不可脱离、不占任务栏）
+    """
+    root = _root_of(parent) or parent
+    win = tk.Toplevel(root)
+    win.title(title)
+    win.transient(root)          # 跟随主窗口，不单独出现在任务栏
+    try:
+        win.attributes("-toolwindow", True)  # 无任务栏图标
+    except Exception:
+        pass
+    # 居中于主窗口（偏上 1/3，避免遮挡底部输入区）
+    try:
+        root.update_idletasks()
+        x = root.winfo_rootx() + max((root.winfo_width() - width) // 2, 0)
+        y = root.winfo_rooty() + max((root.winfo_height() - height) // 3, 0)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+    except Exception:
+        win.geometry(f"{width}x{height}")
+    win.minsize(min(width, 360), min(height, 240))
+    if modal:
+        win.grab_set()           # 模态：操作主窗口前必须先关闭弹窗
+    return win
+
+
+def _mb_info(widget, title, message):
+    """消息框（info）— 归属主窗口"""
+    return messagebox.showinfo(title, message, parent=_root_of(widget))
+
+
+def _mb_warn(widget, title, message):
+    """消息框（warning）— 归属主窗口"""
+    return messagebox.showwarning(title, message, parent=_root_of(widget))
+
+
+def _mb_error(widget, title, message):
+    """消息框（error）— 归属主窗口"""
+    return messagebox.showerror(title, message, parent=_root_of(widget))
+
+
+def _mb_ask(widget, title, message):
+    """确认框（yes/no）— 归属主窗口"""
+    return messagebox.askyesno(title, message, parent=_root_of(widget))
+
+
 # ==================== 面板基类 ====================
 
 class BasePanel(ABC):
@@ -61,10 +119,8 @@ class ReasoningWindow:
     """
 
     def __init__(self, parent: tk.Widget, title: str = "🧠 深度思考"):
-        self._win = tk.Toplevel(parent)
-        self._win.title(title)
-        self._win.geometry("560x420")
-        self._win.minsize(360, 240)
+        # ★ v2.3: 约束到主窗口（非模态，用户可同时滚动主窗口）
+        self._win = _dialog_toplevel(parent, title, 560, 420, modal=False)
         # 置顶于主窗口之上，方便边看思考边等正文
         try:
             self._win.attributes("-topmost", True)
@@ -169,6 +225,9 @@ class ChatPanel(BasePanel):
         self._current_reasoning = ""        # 本次回复的思考内容缓存
         self._pending_tool_calls: list[dict] = []  # 本次回复涉及的工具调用
         self._collapsible_seq = 0           # 折叠标记行自增序号
+        # ★ v2.3 消息卡片体系
+        self._msg_data: list[dict] = []     # 消息数据（用于复制全文）
+        self._streaming_text: Optional[tk.Text] = None  # 当前 AI 气泡正文（流式插入）
         # 内容勾选状态: {node_id: (title, content, checked)}
         self._content_checkboxes: dict[str, tk.BooleanVar] = {}
         self._selected_content: list[str] = []  # 选中的完整文本
@@ -290,28 +349,40 @@ class ChatPanel(BasePanel):
                                              font=("Microsoft YaHei", 8), bg="#fafafa")
         self._content_count_label.pack(side="right", padx=6)
 
-        # ── 消息区 ──
-        msg_frame = tk.Frame(self.frame, bg="#ffffff")
-        msg_frame.pack(fill="both", expand=True)
+        # ── 消息区（★ v2.3 Canvas + 气泡卡片重构） ──
+        self._msg_frame = tk.Frame(self.frame, bg="#f5f6fa")
+        self._msg_frame.pack(fill="both", expand=True)
 
-        self._msg_text = tk.Text(msg_frame, wrap="word", state="disabled",
-                                 font=("Microsoft YaHei", 11), bg="#ffffff",
-                                 fg="#333333", padx=16, pady=8, borderwidth=0)
-        self._msg_text.pack(side="left", fill="both", expand=True)
-        scrollbar = tk.Scrollbar(msg_frame, command=self._msg_text.yview)
-        scrollbar.pack(side="right", fill="y")
-        self._msg_text.config(yscrollcommand=scrollbar.set)
+        self._msg_canvas = tk.Canvas(self._msg_frame, bg="#f5f6fa", highlightthickness=0)
+        self._msg_canvas.pack(side="left", fill="both", expand=True)
+        self._msg_scrollbar = tk.Scrollbar(self._msg_frame, orient="vertical",
+                                           command=self._msg_canvas.yview)
+        self._msg_scrollbar.pack(side="right", fill="y")
+        self._msg_canvas.configure(yscrollcommand=self._msg_scrollbar.set)
+
+        # 消息容器（嵌入 canvas）
+        self._msg_inner = tk.Frame(self._msg_canvas, bg="#f5f6fa")
+        self._msg_inner_window = self._msg_canvas.create_window(
+            (0, 0), window=self._msg_inner, anchor="nw")
+        self._msg_inner.bind(
+            "<Configure>",
+            lambda e: self._msg_canvas.configure(scrollregion=self._msg_canvas.bbox("all")))
+        self._msg_canvas.bind("<Configure>", self._on_msg_canvas_resize)
+        # 鼠标滚轮
+        self._msg_canvas.bind("<MouseWheel>", self._on_msg_scroll)   # Windows
+        self._msg_canvas.bind("<Button-4>", self._on_msg_scroll)     # Linux 上滚
+        self._msg_canvas.bind("<Button-5>", self._on_msg_scroll)     # Linux 下滚
 
         # 消息区右键菜单
         self._msg_menu = tk.Menu(self.frame, tearoff=0)
         self._msg_menu.add_command(label="📋 复制全文", command=self._copy_all_messages)
         self._msg_menu.add_command(label="🔄 重试", command=self._retry_last)
-        self._msg_text.bind("<Button-3>", lambda e: self._msg_menu.post(e.x_root, e.y_root))
+        self._msg_canvas.bind("<Button-3>", lambda e: self._msg_menu.post(e.x_root, e.y_root))
 
         # 占位提示（无消息时显示）
         self._msg_placeholder = tk.Label(
-            msg_frame, text="💬 暂无消息\n在下方输入框开始对话",
-            font=("Microsoft YaHei", 12), bg="#ffffff", fg="#bbbbbb", justify="center"
+            self._msg_frame, text="💬 暂无消息\n在下方输入框开始对话",
+            font=("Microsoft YaHei", 12), bg="#f5f6fa", fg="#bbbbbb", justify="center"
         )
         self._msg_placeholder.place(relx=0.5, rely=0.5, anchor="center")
 
@@ -503,7 +574,7 @@ class ChatPanel(BasePanel):
         if self._content_panel_visible:
             self._content_panel.pack_forget()
         else:
-            self._content_panel.pack(fill="x", before=self._msg_text.master)
+            self._content_panel.pack(fill="x", before=self._msg_frame)
             self._refresh_content_tree(keep_state=True)
         self._content_panel_visible = not self._content_panel_visible
 
@@ -872,6 +943,7 @@ class ChatPanel(BasePanel):
         self._response_buffer = ""
         self._is_streaming = True
         self._ai_prefix_inserted = False
+        self._streaming_text = None  # ★ v2.3 新气泡由首个 chunk 懒创建
         # ★ v2.2.2 重置深度思考状态（弹窗在收到首个 chunk 时懒创建）
         self._current_reasoning = ""
         self._pending_tool_calls = []
@@ -905,15 +977,52 @@ class ChatPanel(BasePanel):
 
         threading.Thread(target=stream_thread, daemon=True).start()
 
+    # ★ v2.3 消息区滚动/容器辅助
+    def _on_msg_canvas_resize(self, event):
+        """canvas 宽度变化 → 同步内部容器宽度"""
+        try:
+            self._msg_canvas.itemconfigure(self._msg_inner_window, width=event.width)
+        except Exception:
+            pass
+
+    def _on_msg_scroll(self, event):
+        """鼠标滚轮滚动消息区"""
+        try:
+            if event.num == 4:
+                self._msg_canvas.yview_scroll(-3, "units")
+            elif event.num == 5:
+                self._msg_canvas.yview_scroll(3, "units")
+            else:
+                self._msg_canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
+        except Exception:
+            pass
+
+    def _scroll_msg_to_bottom(self):
+        """滚动到消息区底部"""
+        try:
+            self._msg_canvas.update_idletasks()
+            self._msg_canvas.yview_moveto(1.0)
+        except Exception:
+            pass
+
+    def _clear_messages(self):
+        """清空消息区全部气泡"""
+        for child in self._msg_inner.winfo_children():
+            child.destroy()
+        self._msg_data = []
+        self._streaming_text = None
+
     def _on_chunk(self, event):
-        self._response_buffer += event.data.get("text", "")
-        self._msg_text.config(state="normal")
-        if not self._ai_prefix_inserted:
-            self._msg_text.insert("end", "\n\n🤖 AI: ")
-            self._ai_prefix_inserted = True
-        self._msg_text.insert("end", event.data.get("text", ""))
-        self._msg_text.see("end")
-        self._msg_text.config(state="disabled")
+        text = event.data.get("text", "")
+        self._response_buffer += text
+        # 懒创建 AI 气泡（首个 chunk 到达时）
+        if self._streaming_text is None:
+            self._append_message("assistant", "", streamable=True)
+        if self._streaming_text is not None:
+            self._streaming_text.configure(state="normal")
+            self._streaming_text.insert("end", text)
+            self._streaming_text.configure(state="disabled")
+        self._scroll_msg_to_bottom()
 
     # ★ v2.2.2 深度思考流式处理
     def _on_reasoning_chunk(self, event):
@@ -973,13 +1082,23 @@ class ChatPanel(BasePanel):
             self._session_manager.add_message(
                 self._current_session_id, "assistant", full,
                 meta=meta if meta else None)
+            # ★ v2.3 更新复制全文用的消息数据（流式期间内容为空）
+            for m in reversed(self._msg_data):
+                if m.get("role") == "assistant":
+                    m["content"] = full
+                    break
 
     def _on_response_error(self, event):
         self._append_message("system", f"❌ 错误: {event.data.get('error', '未知错误')}")
 
     def _copy_all_messages(self):
-        """复制消息区全文到剪贴板"""
-        all_text = self._msg_text.get("1.0", "end-1c")
+        """复制消息区全文到剪贴板（★ v2.3 从消息数据拼装）"""
+        parts = []
+        for m in self._msg_data:
+            prefix = {"user": "👤 你", "assistant": "🤖 AI", "system": "⚙ 系统"}.get(
+                m.get("role", ""), m.get("role", ""))
+            parts.append(f"{prefix}: {m.get('content', '')}")
+        all_text = "\n\n".join(parts)
         self.frame.clipboard_clear()
         self.frame.clipboard_append(all_text)
 
@@ -998,7 +1117,16 @@ class ChatPanel(BasePanel):
             self._input_text.insert("1.0", last_user)
             self._on_send()
 
-    def _append_message(self, role: str, content: str, meta: dict | None = None):
+    def _append_message(self, role: str, content: str, meta: dict | None = None,
+                        streamable: bool = False):
+        """追加一条消息气泡卡片（★ v2.3 Canvas 重构）
+
+        - user: 右侧蓝色气泡
+        - assistant: 左侧白色气泡（streamable=True 时保存正文引用供流式插入）
+        - system: 居中灰色条
+        - tool: 折叠卡片
+        - assistant meta.reasoning / meta.tool_calls: 气泡下方内嵌折叠卡片
+        """
         # 隐藏占位提示
         if hasattr(self, '_msg_placeholder') and self._msg_placeholder.winfo_ismapped():
             self._msg_placeholder.place_forget()
@@ -1019,13 +1147,56 @@ class ChatPanel(BasePanel):
             except Exception:
                 pass  # 非 JSON 格式，按普通消息显示
 
-        self._msg_text.config(state="normal")
-        prefix = {"user": "👤 你", "assistant": "🤖 AI", "system": "⚙ 系统"}.get(role, role)
-        self._msg_text.insert("end", f"\n\n{prefix}: {content}")
-        self._msg_text.see("end")
-        self._msg_text.config(state="disabled")
+        # 记录用于"复制全文"
+        self._msg_data.append({"role": role, "content": content})
 
-        # ★ v2.2.2 assistant 消息附带 reasoning / tool_calls → 折叠展示
+        # 系统消息：居中灰色条
+        if role == "system":
+            bar = tk.Frame(self._msg_inner, bg="#f5f6fa")
+            bar.pack(fill="x", pady=(10, 2), padx=24)
+            tk.Label(bar, text=content, font=("Microsoft YaHei", 9),
+                     bg="#e9ecef", fg="#666666", padx=10, pady=4).pack()
+            self._scroll_msg_to_bottom()
+            return
+
+        # 用户/AI 消息：气泡卡片
+        is_user = role == "user"
+        bubble_color = "#0078d4" if is_user else "#ffffff"
+        text_color = "#ffffff" if is_user else "#333333"
+        label_color = "#e8f0fe" if is_user else "#999999"
+
+        outer = tk.Frame(self._msg_inner, bg="#f5f6fa")
+        outer.pack(fill="x", padx=12, pady=(8, 2))
+        align = tk.Frame(outer, bg="#f5f6fa")
+        align.pack(anchor="e" if is_user else "w", fill="x")
+
+        # 气泡宽度：消息区 72%（上限 720px）
+        try:
+            canvas_w = max(self._msg_canvas.winfo_width(), 400)
+        except Exception:
+            canvas_w = 600
+        bubble_w = min(int(canvas_w * 0.72), 720)
+        bubble = tk.Frame(align, bg=bubble_color, padx=12, pady=8,
+                          width=bubble_w, highlightthickness=1,
+                          highlightbackground="#dde1e6" if not is_user else bubble_color)
+        bubble.pack_propagate(False)
+        bubble.pack(side="right" if is_user else "left")
+
+        # 角色标签
+        tk.Label(bubble, text="👤 你" if is_user else "🤖 AI",
+                 font=("Microsoft YaHei", 8, "bold"),
+                 bg=bubble_color, fg=label_color, anchor="w").pack(fill="x", pady=(0, 2))
+        # 正文（只读 Text，支持长文本自动换行）
+        body = tk.Text(bubble, wrap="word", font=("Microsoft YaHei", 11),
+                       bg=bubble_color, fg=text_color, borderwidth=0,
+                       highlightthickness=0, padx=2, pady=2)
+        body.insert("1.0", content)
+        body.configure(state="disabled")
+        body.pack(fill="both", expand=True)
+        if streamable:
+            self._streaming_text = body
+
+        # assistant 消息附带的折叠块
         if role == "assistant" and meta:
             reasoning = meta.get("reasoning")
             if reasoning:
@@ -1035,29 +1206,47 @@ class ChatPanel(BasePanel):
                 args = tc.get("args", {})
                 self._append_collapsible("🔧", f"调用工具: {tool_name}",
                                          json.dumps(args, ensure_ascii=False))
+        self._scroll_msg_to_bottom()
 
     def _append_collapsible(self, icon: str, title: str, detail: str):
-        """插入折叠标记行 — 灰色底纹 + [右键查看]；右键弹出完整详情"""
-        self._msg_text.config(state="normal")
-        start = self._msg_text.index("end-1c")
-        self._msg_text.insert("end", f"\n\n⚙ {icon} {title}  [💡 右键查看]")
-        end = self._msg_text.index("end-1c")
+        """折叠卡片 — 点击标题展开/收起详情；右键弹出详情窗口（★ v2.3）"""
+        card = tk.Frame(self._msg_inner, bg="#eef1f5", padx=10, pady=6)
+        card.pack(fill="x", padx=28, pady=(4, 2))
+
+        header = tk.Frame(card, bg="#eef1f5", cursor="hand2")
+        header.pack(fill="x")
+        tk.Label(header, text=f"{icon} {title}  ▸ 点击展开", font=("Microsoft YaHei", 9),
+                 bg="#eef1f5", fg="#555555", anchor="w").pack(side="left")
+        tk.Label(header, text="[右键 查看详情]", font=("Microsoft YaHei", 8),
+                 bg="#eef1f5", fg="#999999").pack(side="right")
+
+        detail_frame = tk.Frame(card, bg="#ffffff")
+        detail_text = tk.Text(detail_frame, wrap="word", font=("Microsoft YaHei", 9),
+                              bg="#ffffff", fg="#444444", height=8,
+                              padx=6, pady=4, borderwidth=1, relief="solid")
+        detail_text.insert("1.0", detail)
+        detail_text.configure(state="disabled")
+        detail_text.pack(fill="both", expand=True)
+
+        state = {"open": False}
+
+        def toggle(_=None):
+            state["open"] = not state["open"]
+            if state["open"]:
+                detail_frame.pack(fill="both", expand=True, pady=(6, 0))
+            else:
+                detail_frame.pack_forget()
+            self._scroll_msg_to_bottom()
+
+        header.bind("<Button-1>", toggle)
+        header.bind("<Button-3>",
+                    lambda e, t=title, d=detail: self._show_detail_popup(e, t, d))
         self._collapsible_seq += 1
-        tag = f"col_{self._collapsible_seq}"
-        self._msg_text.tag_add(tag, start, end)
-        self._msg_text.tag_configure(tag, background="#f0f4f8", foreground="#555555",
-                                     font=("Microsoft YaHei", 9))
-        self._msg_text.tag_bind(tag, "<Button-3>",
-                                lambda e, t=title, d=detail: self._show_detail_popup(e, t, d))
-        self._msg_text.see("end")
-        self._msg_text.config(state="disabled")
+        self._scroll_msg_to_bottom()
 
     def _show_detail_popup(self, event, title: str, detail: str):
-        """右键折叠标记行 → 弹出详细内容窗口"""
-        win = tk.Toplevel(self.frame)
-        win.title(title)
-        win.geometry("520x400")
-        win.minsize(360, 240)
+        """右键折叠标记行 → 弹出详细内容窗口（★ v2.3 约束到主窗口）"""
+        win = _dialog_toplevel(self.frame, title, 520, 400)
         tk.Label(win, text=title, font=("Microsoft YaHei", 10, "bold"),
                  bg="#f0f4f8").pack(fill="x", padx=8, pady=6)
         text = tk.Text(win, wrap="word", font=("Microsoft YaHei", 10))
@@ -1068,9 +1257,7 @@ class ChatPanel(BasePanel):
     def _new_session(self):
         s = self._session_manager.create_session()
         self._current_session_id = s.session_id
-        self._msg_text.config(state="normal")
-        self._msg_text.delete("1.0", "end")
-        self._msg_text.config(state="disabled")
+        self._clear_messages()
         self._show_placeholder()
         self._refresh_session_list()
         # ★ v2.2.2 清理深度思考弹窗
@@ -1082,9 +1269,7 @@ class ChatPanel(BasePanel):
         if self._current_session_id:
             self._session_manager.delete_session(self._current_session_id)
             self._current_session_id = None
-            self._msg_text.config(state="normal")
-            self._msg_text.delete("1.0", "end")
-            self._msg_text.config(state="disabled")
+            self._clear_messages()
             self._show_placeholder()
             self._refresh_session_list()
             # ★ v2.2.2 清理深度思考弹窗
@@ -1109,9 +1294,7 @@ class ChatPanel(BasePanel):
             self._reasoning_window.close()
             self._reasoning_window = None
         # 立即清空并显示加载状态
-        self._msg_text.config(state="normal")
-        self._msg_text.delete("1.0", "end")
-        self._msg_text.config(state="disabled")
+        self._clear_messages()
         self._append_message("system", "⏳ 正在加载历史会话...")
 
         def load():
@@ -1132,9 +1315,7 @@ class ChatPanel(BasePanel):
         if self._current_session_id != session_id:
             return
         if index == 0:
-            self._msg_text.config(state="normal")
-            self._msg_text.delete("1.0", "end")
-            self._msg_text.config(state="disabled")
+            self._clear_messages()
         batch = msgs[index:index + 10]
         for m in batch:
             self._append_message(m.get("role", "system"), m.get("content", ""), meta=m)
@@ -1504,10 +1685,7 @@ class OutlinePanel(BasePanel):
         self._refresh_all()
 
     def _create_project(self):
-        dialog = tk.Toplevel(self.frame)
-        dialog.title("创建项目")
-        dialog.geometry("300x150")
-        dialog.transient(self.frame)
+        dialog = _dialog_toplevel(self.frame, "创建项目", 300, 150)
 
         tk.Label(dialog, text="项目名称:").pack(padx=16, pady=8)
         name_entry = tk.Entry(dialog, width=30)
@@ -1523,7 +1701,7 @@ class OutlinePanel(BasePanel):
                     dialog.destroy()
                     self._refresh_all()
                 except ValueError as e:
-                    messagebox.showerror("错误", str(e))
+                    _mb_error(self.frame, "错误", str(e))
 
         tk.Button(dialog, text="创建", command=do_create).pack(pady=12)
         name_entry.bind("<Return>", lambda e: do_create())
@@ -1611,7 +1789,7 @@ class OutlinePanel(BasePanel):
                 level = OutlineLevel.OUTLINE
                 title_hint = "全书大纲"
             else:
-                messagebox.showinfo("提示", "请先在左侧大纲树中选择一个父节点")
+                _mb_info(self.frame, "提示", "请先在左侧大纲树中选择一个父节点")
                 return
         else:
             parent = self._project_service.get_node(self._current_node_id)
@@ -1621,10 +1799,7 @@ class OutlinePanel(BasePanel):
             level = OutlineLevel(min(parent.level.value + 1, 5))
             title_hint = ""
 
-        dialog = tk.Toplevel(self.frame)
-        dialog.title("创建节点")
-        dialog.geometry("300x120")
-        dialog.transient(self.frame)
+        dialog = _dialog_toplevel(self.frame, "创建节点", 300, 120)
 
         tk.Label(dialog, text="节点标题:").pack(padx=16, pady=4)
         entry = tk.Entry(dialog, width=30)
@@ -1646,15 +1821,12 @@ class OutlinePanel(BasePanel):
     def _merge_nodes(self):
         selected = self._child_list.curselection()
         if len(selected) < 2:
-            messagebox.showinfo("提示", "请在子节点列表中选中至少 2 个节点进行合并")
+            _mb_info(self.frame, "提示", "请在子节点列表中选中至少 2 个节点进行合并")
             return
         children = self._project_service.get_children(self._current_node_id or "")
         child_ids = [children[i].node_id for i in selected if i < len(children)]
 
-        dialog = tk.Toplevel(self.frame)
-        dialog.title("合并节点")
-        dialog.geometry("300x120")
-        dialog.transient(self.frame)
+        dialog = _dialog_toplevel(self.frame, "合并节点", 300, 120)
         tk.Label(dialog, text="合并后节点标题:").pack(padx=16, pady=4)
         entry = tk.Entry(dialog, width=30)
         entry.pack(padx=16, pady=4)
@@ -1667,7 +1839,7 @@ class OutlinePanel(BasePanel):
                     dialog.destroy()
                     self._refresh_tree()
                 except ValueError as e:
-                    messagebox.showerror("错误", str(e))
+                    _mb_error(self.frame, "错误", str(e))
 
         tk.Button(dialog, text="合并", command=do_merge).pack(pady=8)
         entry.bind("<Return>", lambda e: do_merge())
@@ -1678,7 +1850,7 @@ class OutlinePanel(BasePanel):
         node = self._project_service.get_node(self._current_node_id)
         if node is None:
             return
-        if messagebox.askyesno("确认删除", f"确定删除「{node.title}」及其所有子节点？"):
+        if _mb_ask(self.frame, "确认删除", f"确定删除「{node.title}」及其所有子节点？"):
             self._project_service.delete_node(self._current_node_id)
             self._current_node_id = None
             self._editor.delete("1.0", "end")
@@ -1727,7 +1899,7 @@ class OutlinePanel(BasePanel):
         if node is None:
             return
         if node.parent_id is None:
-            messagebox.showinfo("���示", "根节点不可更改父节点")
+            _mb_info(self.frame, "���示", "根节点不可更改父节点")
             return
 
         # 收集所有可选父节点（排除自身、子孙节点、当前父节点）
@@ -1753,14 +1925,11 @@ class OutlinePanel(BasePanel):
         ]
 
         if not candidates:
-            messagebox.showinfo("提示", "没有可选的父节点")
+            _mb_info(self.frame, "提示", "没有可选的父节点")
             return
 
         # 弹出选择对话框
-        dialog = tk.Toplevel(self.frame)
-        dialog.title("选择新父节点")
-        dialog.geometry("360x320")
-        dialog.transient(self.frame)
+        dialog = _dialog_toplevel(self.frame, "选择新父节点", 360, 320)
 
         tk.Label(dialog, text=f"将「{node.title}」移动到哪个父节点下？",
                  font=("Microsoft YaHei", 10)).pack(padx=16, pady=8)
@@ -1791,7 +1960,7 @@ class OutlinePanel(BasePanel):
                     "OutlinePanel", "INFO",
                 )
             except Exception as e:
-                messagebox.showerror("错误", str(e))
+                _mb_error(self.frame, "错误", str(e))
 
         tk.Button(btn_frame, text="确认移动", command=do_move,
                   font=("Microsoft YaHei", 10), bg="#0078d4", fg="#ffffff",
@@ -1953,20 +2122,17 @@ class OutlinePanel(BasePanel):
     def _ai_generate(self):
         """AI 辅助：为选中节点自动生成子节点"""
         if not self._ai_client:
-            messagebox.showinfo("提示", "AI 客户端未初始化，无法使用 AI 生成功能")
+            _mb_info(self.frame, "提示", "AI 客户端未初始化，无法使用 AI 生成功能")
             return
         if not self._current_node_id:
-            messagebox.showinfo("提示", "请先在左侧大纲树中选中一个节点")
+            _mb_info(self.frame, "提示", "请先在左侧大纲树中选中一个节点")
             return
         node = self._project_service.get_node(self._current_node_id)
         if node is None:
             return
 
         # 弹出设置对话框
-        dialog = tk.Toplevel(self.frame)
-        dialog.title("AI 辅助生成子节点")
-        dialog.geometry("380x280")
-        dialog.transient(self.frame)
+        dialog = _dialog_toplevel(self.frame, "AI 辅助生成子节点", 380, 280)
 
         tk.Label(dialog, text=f"为「{node.title}」生成子节点",
                  font=("Microsoft YaHei", 10, "bold")).pack(padx=16, pady=(12, 8))
@@ -2051,11 +2217,11 @@ class OutlinePanel(BasePanel):
                 self._refresh_tree()
                 dialog.destroy()
                 if created == 0:
-                    messagebox.showwarning("提示", "AI 未能生成有效的子节点，请重试。")
+                    _mb_warn(self.frame, "提示", "AI 未能生成有效的子节点，请重试。")
 
             except Exception as e:
                 dialog.destroy()
-                messagebox.showerror("AI 生成失败",
+                _mb_error(self.frame, "AI 生成失败",
                                      f"错误: {str(e)}\n请检查 AI 配置和网络连接。")
                 self._logger.log(f"AI 生成失败: {e}", "OutlinePanel", "ERROR")
 
@@ -2071,21 +2237,21 @@ class OutlinePanel(BasePanel):
         """将选中节点提升一级（移至父节点的父节点下）"""
         selection = self._tree.selection()
         if not selection:
-            messagebox.showinfo("提示", "请先在左侧大纲树中选中一个节点")
+            _mb_info(self.frame, "提示", "请先在左侧大纲树中选中一个节点")
             return
         node_id = selection[0]
         node = self._project_service.get_node(node_id)
         if node is None:
             return
         if node.parent_id is None:
-            messagebox.showinfo("提示", "根节点无法再升级")
+            _mb_info(self.frame, "提示", "根节点无法再升级")
             return
         if node.level == OutlineLevel.OUTLINE:
-            messagebox.showinfo("提示", "L1 大纲已是最高层级，无法升级")
+            _mb_info(self.frame, "提示", "L1 大纲已是最高层级，无法升级")
             return
         parent = self._project_service.get_node(node.parent_id)
         if parent is None or parent.parent_id is None:
-            messagebox.showinfo("提示", "父节点之上没有可挂载的位置")
+            _mb_info(self.frame, "提示", "父节点之上没有可挂载的位置")
             return
         self._auto_save_if_dirty()
         grandparent = self._project_service.get_node(parent.parent_id)
@@ -2095,29 +2261,29 @@ class OutlinePanel(BasePanel):
             self._refresh_tree()
             self._logger.log(f"节点「{node.title}」已升级", "OutlinePanel", "INFO")
         except Exception as e:
-            messagebox.showerror("错误", str(e))
+            _mb_error(self.frame, "错误", str(e))
 
     def _demote_node(self):
         """将选中节点降低一级（移至前一个兄弟节点的最后一个子节点下）"""
         selection = self._tree.selection()
         if not selection:
-            messagebox.showinfo("提示", "请先在左侧大纲树中选中一个节点")
+            _mb_info(self.frame, "提示", "请先在左侧大纲树中选中一个节点")
             return
         node_id = selection[0]
         node = self._project_service.get_node(node_id)
         if node is None:
             return
         if node.parent_id is None:
-            messagebox.showinfo("提示", "根节点无法降级")
+            _mb_info(self.frame, "提示", "根节点无法降级")
             return
         if node.level == OutlineLevel.CONTENT:
-            messagebox.showinfo("提示", "L5 正文已是底层，无法降级")
+            _mb_info(self.frame, "提示", "L5 正文已是底层，无法降级")
             return
         # 找到前一个兄弟节点，将自己挂到它的最末尾
         siblings = self._project_service.get_children(node.parent_id)
         my_idx = next((i for i, s in enumerate(siblings) if s.node_id == node_id), -1)
         if my_idx <= 0:
-            messagebox.showinfo("提示", "没有前序兄弟节点可用于降级")
+            _mb_info(self.frame, "提示", "没有前序兄弟节点可用于降级")
             return
         prev_sibling = siblings[my_idx - 1]
         self._auto_save_if_dirty()
@@ -2128,7 +2294,7 @@ class OutlinePanel(BasePanel):
             self._logger.log(f"节点「{node.title}」已降级到「{prev_sibling.title}」下",
                              "OutlinePanel", "INFO")
         except Exception as e:
-            messagebox.showerror("错误", str(e))
+            _mb_error(self.frame, "错误", str(e))
 
     # ── 重命名 ──
 
@@ -2152,7 +2318,7 @@ class OutlinePanel(BasePanel):
         """按钮触发的重命名（大纲树选中节点）"""
         selection = self._tree.selection()
         if not selection:
-            messagebox.showinfo("提示", "请先在左侧大纲树中选择一个节点")
+            _mb_info(self.frame, "提示", "请先在左侧大纲树中选择一个节点")
             return
         self._on_node_rename(None)
 
@@ -2367,10 +2533,7 @@ class SettingsPanel(BasePanel):
         self._content_modified = False
 
     def _create_category(self):
-        dialog = tk.Toplevel(self.frame)
-        dialog.title("新建分类")
-        dialog.geometry("300x120")
-        dialog.transient(self.frame)
+        dialog = _dialog_toplevel(self.frame, "新建分类", 300, 120)
         tk.Label(dialog, text="分类名称（如：力量体系、角色、地理）:").pack(padx=16, pady=4)
         entry = tk.Entry(dialog, width=30)
         entry.pack(padx=16, pady=4)
@@ -2388,7 +2551,7 @@ class SettingsPanel(BasePanel):
 
     def _delete_category(self):
         self._auto_save_if_dirty()
-        if self._current_cat and messagebox.askyesno("确认", f"删除分类「{self._current_cat}」及其所有文档？"):
+        if self._current_cat and _mb_ask(self.frame, "确认", f"删除分类「{self._current_cat}」及其所有文档？"):
             self._project_service.delete_category(self._current_cat)
             self._current_cat = None
             self._current_doc = None
@@ -2398,12 +2561,9 @@ class SettingsPanel(BasePanel):
 
     def _create_doc(self):
         if not self._current_cat:
-            messagebox.showinfo("提示", "请先选择一个分类")
+            _mb_info(self.frame, "提示", "请先选择一个分类")
             return
-        dialog = tk.Toplevel(self.frame)
-        dialog.title("新建文档")
-        dialog.geometry("300x120")
-        dialog.transient(self.frame)
+        dialog = _dialog_toplevel(self.frame, "新建文档", 300, 120)
         tk.Label(dialog, text="文档名称:").pack(padx=16, pady=4)
         entry = tk.Entry(dialog, width=30)
         entry.pack(padx=16, pady=4)
@@ -2436,7 +2596,7 @@ class SettingsPanel(BasePanel):
     def _delete_doc(self):
         self._auto_save_if_dirty()
         if self._current_cat and self._current_doc:
-            if messagebox.askyesno("确认", f"删除文档「{self._current_doc}」？"):
+            if _mb_ask(self.frame, "确认", f"删除文档「{self._current_doc}」？"):
                 self._project_service.delete_setting(self._current_cat, self._current_doc)
                 self._current_doc = None
                 self._editor.delete("1.0", "end")
@@ -2463,7 +2623,7 @@ class SettingsPanel(BasePanel):
         """按钮触发分类重命名"""
         sel = self._cat_list.curselection()
         if not sel:
-            messagebox.showinfo("提示", "请先选择一个分类")
+            _mb_info(self.frame, "提示", "请先选择一个分类")
             return
         self._on_cat_rename(None)
 
@@ -2516,7 +2676,7 @@ class SettingsPanel(BasePanel):
         """按钮触发文档重命名"""
         sel = self._doc_list.curselection()
         if not sel or not self._current_cat:
-            messagebox.showinfo("提示", "请先选择一个文档")
+            _mb_info(self.frame, "提示", "请先选择一个文档")
             return
         self._on_doc_rename(None)
 
@@ -2552,7 +2712,7 @@ class SettingsPanel(BasePanel):
         out_dir = filedialog.askdirectory(title="选择导出目录")
         if out_dir:
             self._project_service.export_settings(output_dir=out_dir, merge=True)
-            messagebox.showinfo("导出完成", f"已导出到 {out_dir}")
+            _mb_info(self.frame, "导出完成", f"已导出到 {out_dir}")
 
 
 # ==================== ConfigPanel ====================
@@ -2765,7 +2925,7 @@ class ConfigPanel(BasePanel):
         base_url = self._entries["base_url"].get().strip()
         api_key = self._entries["api_key"].get().strip()
         if not name or not base_url:
-            messagebox.showwarning("提示", "名称和 Base URL 为必填项")
+            _mb_warn(self.frame, "提示", "名称和 Base URL 为必填项")
             return
 
         source = AISourceConfig(
@@ -2798,17 +2958,17 @@ class ConfigPanel(BasePanel):
                 top_p=source.top_p,
                 max_tokens=source.max_tokens,
             )
-        messagebox.showinfo("保存成功", f"AI 源「{name}」已保存")
+        _mb_info(self.frame, "保存成功", f"AI 源「{name}」已保存")
 
     def _set_as_current(self):
         """将当前选中的 AI 源设为激活状态"""
         name = self._entries["name"].get().strip()
         if not name:
-            messagebox.showwarning("提示", "请先选择或输入一个 AI 源名称")
+            _mb_warn(self.frame, "提示", "请先选择或输入一个 AI 源名称")
             return
         source = self._config_manager.get_ai_source(name)
         if source is None:
-            messagebox.showwarning("提示", f"AI 源「{name}」不存在，请先保存")
+            _mb_warn(self.frame, "提示", f"AI 源「{name}」不存在，请先保存")
             return
         api_key = self._config_manager.get_api_key(name) or ""
         self._config_manager.set_current_ai_source(name)
@@ -2821,10 +2981,10 @@ class ConfigPanel(BasePanel):
             top_p=source.top_p,
             max_tokens=source.max_tokens,
         )
-        messagebox.showinfo("切换成功", f"当前 AI 源已切换为「{name}」")
+        _mb_info(self.frame, "切换成功", f"当前 AI 源已切换为「{name}」")
 
     def _delete_source(self):
-        if self._current_source_name and messagebox.askyesno("确认", f"删除 AI 源「{self._current_source_name}」？"):
+        if self._current_source_name and _mb_ask(self.frame, "确认", f"删除 AI 源「{self._current_source_name}」？"):
             self._config_manager.remove_ai_source(self._current_source_name)
             self._clear_form()
             self._current_source_name = None
@@ -2835,16 +2995,16 @@ class ConfigPanel(BasePanel):
         base_url = self._entries["base_url"].get().strip()
         api_key = self._entries["api_key"].get().strip()
         if not base_url:
-            messagebox.showwarning("提示", "请填写 Base URL")
+            _mb_warn(self.frame, "提示", "请填写 Base URL")
             return
 
         self._ai_client.configure(base_url=base_url, api_key=api_key)
         result = self._ai_client.test_connection()
         if result["success"]:
             models_str = "\n".join(result.get("models", [])[:10])
-            messagebox.showinfo("连接成功", f"连接成功！\n可用模型（前10个）:\n{models_str}")
+            _mb_info(self.frame, "连接成功", f"连接成功！\n可用模型（前10个）:\n{models_str}")
         else:
-            messagebox.showerror("连接失败", result.get("error", "未知错误"))
+            _mb_error(self.frame, "连接失败", result.get("error", "未知错误"))
 
     def _clear_form(self):
         for entry in self._entries.values():
@@ -3061,11 +3221,7 @@ class CharacterPanel(BasePanel):
             pass
 
     def _create_character(self):
-        dialog = tk.Toplevel(self.frame)
-        dialog.title("创建角色")
-        dialog.geometry("300x120")
-        dialog.transient(self.frame)
-        dialog.grab_set()
+        dialog = _dialog_toplevel(self.frame, "创建角色", 300, 120)
         tk.Label(dialog, text="角色名称:", font=("Microsoft YaHei", 10)).pack(padx=16, pady=8)
         name_var = tk.StringVar()
         entry = tk.Entry(dialog, textvariable=name_var, font=("Microsoft YaHei", 10))
@@ -3079,7 +3235,7 @@ class CharacterPanel(BasePanel):
                     self._project_service.character_service.create_character(name)
                     self._refresh_character_list()
                 except ValueError as e:
-                    messagebox.showerror("错误", str(e))
+                    _mb_error(self.frame, "错误", str(e))
             dialog.destroy()
 
         entry.bind("<Return>", lambda e: _do_create())
@@ -3091,7 +3247,7 @@ class CharacterPanel(BasePanel):
             return
         cs = self._project_service.character_service
         char = cs.get_character(self._current_char_id)
-        if char and messagebox.askyesno("确认删除", f"确定要删除角色「{char.name}」吗？"):
+        if char and _mb_ask(self.frame, "确认删除", f"确定要删除角色「{char.name}」吗？"):
             cs.delete_character(self._current_char_id)
             self._current_char_id = None
             self._refresh_character_list()
@@ -3120,7 +3276,7 @@ class CharacterPanel(BasePanel):
             self._fields_dirty = False
             self._refresh_character_list()
         except ValueError as e:
-            messagebox.showerror("错误", str(e))
+            _mb_error(self.frame, "错误", str(e))
 
     # ── 阵营标签 ──
     def _refresh_camp_tags(self):
@@ -3163,11 +3319,7 @@ class CharacterPanel(BasePanel):
 
     def _show_camp_dialog(self):
         """阵营管理对话框 — ★ 支持上下调整顺序"""
-        dialog = tk.Toplevel(self.frame)
-        dialog.title("管理阵营")
-        dialog.geometry("480x400")
-        dialog.transient(self.frame)
-        dialog.grab_set()
+        dialog = _dialog_toplevel(self.frame, "管理阵营", 480, 400)
 
         cs = self._project_service.character_service
 
@@ -3258,7 +3410,7 @@ class CharacterPanel(BasePanel):
         def _save_camp():
             name = name_var.get().strip()
             if not name:
-                messagebox.showwarning("提示", "请输入阵营名称")
+                _mb_warn(self.frame, "提示", "请输入阵营名称")
                 return
             try:
                 sel = camp_list.curselection()
@@ -3284,20 +3436,20 @@ class CharacterPanel(BasePanel):
                                 self._refresh_camp_tags()
                                 break
             except Exception as e:
-                messagebox.showerror("错误", f"保存阵营失败: {e}")
+                _mb_error(self.frame, "错误", f"保存阵营失败: {e}")
 
         def _delete_camp():
             sel = camp_list.curselection()
             if sel:
                 camps = cs.list_camps()
-                if sel[0] < len(camps) and messagebox.askyesno("确认删除", f"确定要删除阵营「{camps[sel[0]].name}」吗？"):
+                if sel[0] < len(camps) and _mb_ask(self.frame, "确认删除", f"确定要删除阵营「{camps[sel[0]].name}」吗？"):
                     try:
                         cs.delete_camp(camps[sel[0]].camp_id)
                         _refresh_camp_list()
                         self._refresh_camp_tags()
                         self._refresh_character_list()
                     except Exception as e:
-                        messagebox.showerror("错误", f"删除阵营失败: {e}")
+                        _mb_error(self.frame, "错误", f"删除阵营失败: {e}")
 
         tk.Button(btn_frame, text="新建/更新", command=_save_camp,
                   font=("Microsoft YaHei", 9), bg="#0078d4", fg="white").pack(side="left", padx=4)
@@ -3321,7 +3473,7 @@ class CharacterPanel(BasePanel):
             cs.update_character(self._current_char_id, bio=bio)
             self._bio_dirty = False
         except ValueError as e:
-            messagebox.showerror("错误", str(e))
+            _mb_error(self.frame, "错误", str(e))
 
 
 # ==================== ForeshadowPanel ★ v2.0 ====================
@@ -3350,9 +3502,11 @@ class ForeshadowPanel(BasePanel):
         list_frame = tk.Frame(self.frame)
         list_frame.pack(fill="both", expand=True)
         self._foreshadow_tree = ttk.Treeview(list_frame,
-            columns=("content", "status"), show="headings", selectmode="browse")
+            columns=("no", "content", "status"), show="headings", selectmode="browse")
+        self._foreshadow_tree.heading("no", text="#")
         self._foreshadow_tree.heading("content", text="伏笔内容")
         self._foreshadow_tree.heading("status", text="状态")
+        self._foreshadow_tree.column("no", width=40, anchor="center")
         self._foreshadow_tree.column("content", width=600)
         self._foreshadow_tree.column("status", width=80, anchor="center")
         scroll_f = tk.Scrollbar(list_frame, orient="vertical", command=self._foreshadow_tree.yview)
@@ -3394,12 +3548,12 @@ class ForeshadowPanel(BasePanel):
             fs = self._project_service.foreshadow_service
             include = self._show_hidden.get()
             items = fs.list_foreshadows(include_hidden=include)
-            for f in items:
+            for idx, f in enumerate(items, 1):
                 status = "👁 隐藏" if f.hidden else "◎"
                 tags = ("hidden",) if f.hidden else ()
                 # ★ 使用 foreshadow_id 作为 Treeview iid，消除索引偏移
                 self._foreshadow_tree.insert("", "end", iid=f.foreshadow_id,
-                    values=(f.content, status), tags=tags)
+                    values=(idx, f.content, status), tags=tags)
             self._foreshadow_tree.tag_configure("hidden", foreground="gray")
             count = len(items)
             hidden_count = sum(1 for f_ in items if f_.hidden)
@@ -3416,7 +3570,7 @@ class ForeshadowPanel(BasePanel):
             self._foreshadow_input.delete("1.0", "end")
             self._refresh_list()
         except ValueError as e:
-            messagebox.showerror("错误", str(e))
+            _mb_error(self.frame, "错误", str(e))
 
     def _get_selected_id(self):
         sel = self._foreshadow_tree.selection()
@@ -3437,12 +3591,7 @@ class ForeshadowPanel(BasePanel):
         f = fs.get_foreshadow(fid)
         if not f:
             return
-        dialog = tk.Toplevel(self.frame)
-        dialog.title("编辑伏笔")
-        dialog.geometry("500x350")
-        dialog.minsize(400, 250)
-        dialog.transient(self.frame)
-        dialog.grab_set()
+        dialog = _dialog_toplevel(self.frame, "编辑伏笔", 500, 350)
         text = tk.Text(dialog, font=("Microsoft YaHei", 10), wrap="word")
         text.insert("1.0", f.content)
         text.pack(fill="both", expand=True, padx=8, pady=8)
@@ -3472,19 +3621,19 @@ class ForeshadowPanel(BasePanel):
                 self._project_service.foreshadow_service.toggle_hidden(fid)
                 self._refresh_list()
             except Exception as e:
-                messagebox.showerror("错误", f"切换失败: {e}")
+                _mb_error(self.frame, "错误", f"切换失败: {e}")
 
     def _on_delete(self, event=None):
         fid = self._get_selected_id()
         if not fid and event:
             item = self._foreshadow_tree.identify_row(event.y)
             fid = item if item else None
-        if fid and messagebox.askyesno("确认删除", "确定要删除这条伏笔吗？"):
+        if fid and _mb_ask(self.frame, "确认删除", "确定要删除这条伏笔吗？"):
             try:
                 self._project_service.foreshadow_service.delete_foreshadow(fid)
                 self._refresh_list()
             except Exception as e:
-                messagebox.showerror("错误", f"删除失败: {e}")
+                _mb_error(self.frame, "错误", f"删除失败: {e}")
 
     def _on_right_click(self, event):
         sel = self._foreshadow_tree.identify_row(event.y)
@@ -3624,7 +3773,7 @@ class StatusPanel(BasePanel):
 
     def _on_ai_generate(self):
         if not self._ai_client:
-            messagebox.showwarning("未配置 AI", "请先在配置面板中配置并测试 AI 连接。")
+            _mb_warn(self.frame, "未配置 AI", "请先在配置面板中配置并测试 AI 连接。")
             return
 
         # ★ 自动从 ConfigManager 加载已保存的 AI 源配置
@@ -3643,11 +3792,11 @@ class StatusPanel(BasePanel):
                 )
 
         if not self._ai_client.is_configured:
-            messagebox.showwarning("AI 未配置", "请先在配置面板中配置 AI 源，并点击「✅ 设为当前」激活。")
+            _mb_warn(self.frame, "AI 未配置", "请先在配置面板中配置 AI 源，并点击「✅ 设为当前」激活。")
             return
 
         # Token 消耗确认
-        if not messagebox.askyesno(
+        if not _mb_ask(self.frame,
             "Token 消耗提醒",
             "此功能需要将大量创作数据上传至 AI 进行分析，预计消耗较多 token。\n\n"
             "上传内容：\n"
@@ -3900,4 +4049,4 @@ class LogPanel(BasePanel):
             with open(file_path, "w", encoding="utf-8") as f:
                 for entry in self._log_entries:
                     f.write(" ".join(entry) + "\n")
-            messagebox.showinfo("导出完成", f"已导出到 {file_path}")
+            _mb_info(self.frame, "导出完成", f"已导出到 {file_path}")
