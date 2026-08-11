@@ -107,6 +107,15 @@ def _configure_ai_client(ai_client, config_manager, logger):
                 top_p=source.top_p,
                 max_tokens=source.max_tokens,
             )
+            # ★ 读取全局配置：启用输出截断自动续写
+            try:
+                gcfg = config_manager.load_app_config()
+                ai_client.set_auto_continue(
+                    getattr(gcfg, "auto_continue", False),
+                    getattr(gcfg, "max_continue_rounds", 3),
+                )
+            except Exception:
+                ai_client.set_auto_continue(False, 3)
             logger.log(f"AI 源已配置: {source.name}", "App", "INFO")
     except Exception as e:
         logger.log(f"AI 源配置失败: {e}", "App", "WARNING")

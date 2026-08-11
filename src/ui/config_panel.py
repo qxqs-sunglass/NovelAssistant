@@ -133,6 +133,25 @@ class ConfigPanel(BasePanel):
         f3.addStretch()
         layout.addWidget(g3)
 
+        # ★ 自动续写
+        g3a = QGroupBox("输出截断自动续写")
+        f3a = QVBoxLayout(g3a)
+        row_a = QHBoxLayout()
+        self._auto_continue_check = QCheckBox("输出达到上限被截断时，自动让 AI 续写剩余内容")
+        self._auto_continue_check.setChecked(getattr(cfg, 'auto_continue', True))
+        row_a.addWidget(self._auto_continue_check)
+        row_a.addStretch()
+        f3a.addLayout(row_a)
+        row_b = QHBoxLayout()
+        row_b.addWidget(QLabel("最多续写轮数:"))
+        self._continue_rounds_spin = QSpinBox()
+        self._continue_rounds_spin.setRange(1, 10)
+        self._continue_rounds_spin.setValue(getattr(cfg, 'max_continue_rounds', 3))
+        row_b.addWidget(self._continue_rounds_spin)
+        row_b.addStretch()
+        f3a.addLayout(row_b)
+        layout.addWidget(g3a)
+
         # Skill Text
         g4 = QGroupBox("对话 Skill 文本（工作流定义）")
         f4 = QVBoxLayout(g4)
@@ -198,6 +217,8 @@ class ConfigPanel(BasePanel):
         self._temp_slider.setValue(int(getattr(cfg, 'temperature', 1.0) * 100))
         self._top_p_slider.setValue(int(getattr(cfg, 'top_p', 0.9) * 100))
         self._max_tokens_spin.setValue(getattr(cfg, 'max_tokens', 2048))
+        self._auto_continue_check.setChecked(getattr(cfg, 'auto_continue', True))
+        self._continue_rounds_spin.setValue(getattr(cfg, 'max_continue_rounds', 3))
         self._skill_text.setPlainText(getattr(cfg, 'chat_skill_text', '') or self._default_skill())
         self._status_template.setPlainText(
             getattr(cfg, 'status_prompt_template', '') or
@@ -317,6 +338,8 @@ class ConfigPanel(BasePanel):
         cfg.temperature = self._temp_slider.value() / 100
         cfg.top_p = self._top_p_slider.value() / 100
         cfg.max_tokens = self._max_tokens_spin.value()
+        cfg.auto_continue = self._auto_continue_check.isChecked()
+        cfg.max_continue_rounds = self._continue_rounds_spin.value()
         cfg.chat_skill_text = self._skill_text.toPlainText()
         cfg.status_prompt_template = self._status_template.toPlainText()
         self._config_manager.save_app_config(cfg)

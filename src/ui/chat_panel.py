@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QFrame,
     QLabel, QTextEdit, QPushButton, QTextBrowser,
     QComboBox, QCheckBox, QTreeWidget, QTreeWidgetItem,
-    QSplitter, QSizePolicy, QApplication, QMenu,
+    QSplitter, QSizePolicy, QApplication, QMenu, QInputDialog,
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont
@@ -13,6 +13,7 @@ from PySide6.QtGui import QFont
 from src.ui.base_panel import BasePanel
 from src.ui.common import (
     dialog_toplevel, ReasoningWindow, DetailPopup,
+    mb_info, mb_error,
 )
 from src.services.ai_client import AIClient, ChatMessage, AIClientError
 from src.services.session_manager import SessionManager
@@ -163,6 +164,8 @@ class ChatPanel(BasePanel):
     response_error_sig = Signal(dict)
     tool_call_sig = Signal(dict)
     tool_result_sig = Signal(dict)
+    # ★ 自动续写提示跨线程桥接
+    continue_sig = Signal(dict)
     # ★ v4修复: 流式结束后的 UI 复位（避免在 AI 线程直接操作控件）
     stream_finished = Signal()
 
@@ -204,6 +207,7 @@ class ChatPanel(BasePanel):
         self.response_error_sig.connect(self._do_response_error)
         self.tool_call_sig.connect(self._do_tool_call)
         self.tool_result_sig.connect(self._do_tool_result)
+        self.continue_sig.connect(self._do_continue)
         self.stream_finished.connect(self._do_stream_finished)
 
     def _setup_ui(self):
@@ -319,6 +323,7 @@ class ChatPanel(BasePanel):
         self._event_bus.subscribe("ai:tool_result", self._on_tool_result_evt)
         self._event_bus.subscribe("ai:reasoning_chunk", self._on_reasoning_chunk)
         self._event_bus.subscribe("ai:reasoning_end", self._on_reasoning_end)
+        self._event_bus.subscribe("ai:continue", self._on_continue_evt)
         self._event_bus.subscribe("project:switched", self._on_project_changed_evt)
 
     def on_show(self):
@@ -998,6 +1003,22 @@ class ChatPanel(BasePanel):
             if m.get("role") == "assistant":
                 m["content"] = full
                 break
+        # ★ 检测到输出被截断（达到 max_tokens 上限），明确告知用户并提供解决办法
+        if data.get("truncated"):
+            max_tok = data.get("max_tokens", "?")
+            cont = data.get("continued_rounds", 0)
+            if cont > 0:
+                self._add_system_bubble(
+                    f"⚠️ 已自动续写 {cont} 轮，但仍达到输出上限（max_tokens={max_tok}），"
+                    f"内容可能仍不完整。\n"
+                    f"建议：提高「最大输出」或改用更高输出上限的模型。"
+                )
+            else:
+                self._add_system_bubble(
+                    f"⚠️ 输出达到上限（max_tokens={max_tok}）被截断，内容可能不完整。\n"
+                    f"建议：在 AI 源设置中提高「最大输出」；若已达模型上限，请改用更高输出上限的模型，"
+                    f"或分多次发送、让 AI 续写剩余内容。"
+                )
         if self._current_session_id:
             meta = {}
             reasoning = data.get("reasoning") or self._current_reasoning
@@ -1022,6 +1043,15 @@ class ChatPanel(BasePanel):
 
     def _do_response_error(self, data: dict):
         self._add_system_bubble(f"❌ 错误: {data.get('error', '未知')}")
+
+    def _on_continue_evt(self, event):
+        # ★ AI 线程 → 主线程桥接（UI 操作只能在主线程）
+        self.continue_sig.emit(event.data)
+
+    def _do_continue(self, data: dict):
+        r = data.get("round", "?")
+        mr = data.get("max_rounds", "?")
+        self._add_system_bubble(f"⏳ 输出较长，正在自动续写第 {r}/{mr} 轮…")
 
     def _do_tool_call(self, data: dict):
         tool = data.get("tool", "?")
@@ -1060,19 +1090,107 @@ class ChatPanel(BasePanel):
 
     # ── Prompt management ──
 
+    def _build_prompt_selector(self, prompt_type: str, text_edit: QTextEdit):
+        """构建提示词模板选择行：下拉选择 + 保存模板 + 删除模板。
+
+        Args:
+            prompt_type: "system"（系统）或 "additional"（附加）
+            text_edit: 关联的文本编辑框，选中模板时把内容填入其中
+        """
+        row = QHBoxLayout()
+        combo = QComboBox()
+        combo.setMinimumWidth(180)
+        combo.addItem("— 选择已保存的模板 —", "")
+
+        def refresh():
+            combo.blockSignals(True)
+            current = combo.currentData()
+            combo.clear()
+            combo.addItem("— 选择已保存的模板 —", "")
+            try:
+                prompts = self._config_manager.list_prompts(prompt_type) if self._config_manager else []
+            except Exception:
+                prompts = []
+            for p in prompts:
+                combo.addItem(p.get("name", "未命名"), p.get("content", ""))
+            if current is not None:
+                idx = combo.findData(current)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+
+        def on_select(_text):
+            content = combo.currentData()
+            if content:
+                text_edit.setPlainText(content)
+
+        combo.currentIndexChanged.connect(on_select)
+
+        def save_template():
+            name, ok = QInputDialog.getText(self, "保存为模板", "模板名称:")
+            if not ok or not name.strip():
+                return
+            content = text_edit.toPlainText()
+            if not content.strip():
+                mb_info(self, "提示", "模板内容为空，无法保存。")
+                return
+            try:
+                if self._config_manager:
+                    self._config_manager.save_prompt(name.strip(), content, prompt_type)
+            except Exception as e:
+                mb_error(self, "保存失败", str(e))
+                return
+            refresh()
+            # 选中刚保存的模板
+            idx = combo.findData(content)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            mb_info(self, "已保存", f"模板「{name.strip()}」已保存。")
+
+        def delete_template():
+            name = combo.currentText()
+            if not name or name == "— 选择已保存的模板 —":
+                mb_info(self, "提示", "请先选择一个要删除的模板。")
+                return
+            try:
+                if self._config_manager:
+                    self._config_manager.delete_prompt(name)
+            except Exception as e:
+                mb_error(self, "删除失败", str(e))
+                return
+            combo.setCurrentIndex(0)
+            refresh()
+            mb_info(self, "已删除", f"模板「{name}」已删除。")
+
+        save_btn = QPushButton("💾 保存为模板")
+        save_btn.setFixedWidth(96)
+        save_btn.clicked.connect(save_template)
+        del_btn = QPushButton("🗑 删除模板")
+        del_btn.setFixedWidth(88)
+        del_btn.clicked.connect(delete_template)
+        row.addWidget(combo, 1)
+        row.addWidget(save_btn)
+        row.addWidget(del_btn)
+        refresh()
+        return row, combo
+
     def _toggle_prompts(self):
-        dlg = dialog_toplevel(self, "提示词", 500, 400)
+        dlg = dialog_toplevel(self, "提示词", 520, 460)
         lay = QVBoxLayout(dlg)
         lay.addWidget(QLabel("系统提示词:"))
         sys_prompt = QTextEdit()
         sys_prompt.setPlaceholderText("输入系统提示词（将拼接在 Skill 文本之后）...")
         sys_prompt.setPlainText(self._sys_prompt)  # ★ v3修复: 预填已保存内容
         lay.addWidget(sys_prompt)
+        sys_row, _ = self._build_prompt_selector("system", sys_prompt)
+        lay.addLayout(sys_row)
         lay.addWidget(QLabel("附加提示词:"))
         add_prompt = QTextEdit()
         add_prompt.setPlaceholderText("输入附加提示词（可选启用）...")
         add_prompt.setPlainText(self._add_prompt)  # ★ v3修复: 预填已保存内容
         lay.addWidget(add_prompt)
+        add_row, _ = self._build_prompt_selector("additional", add_prompt)
+        lay.addLayout(add_row)
         enable = QCheckBox("启用附加提示词")
         enable.setChecked(self._add_enabled)  # ★ v3修复: 恢复启用状态
         lay.addWidget(enable)

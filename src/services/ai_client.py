@@ -399,6 +399,10 @@ class AIClient:
         # 方案A：幻觉工具调用自动修复
         self._fix_hallucinations: bool = True
 
+        # ★ 自动续写：当输出达到 max_tokens 上限被截断时，自动让 AI 续写剩余内容
+        self._auto_continue: bool = False
+        self._max_continue_rounds: int = 3
+
         # OpenAI 客户端（延迟创建）
         self._client: Optional[OpenAI] = None
 
@@ -553,50 +557,110 @@ class AIClient:
             raise AIClientError("模型名未设置，请在配置中填写模型名称", "not_configured")
         full_messages = self._build_messages(messages, system_prompt)
         try:
-            stream = client.chat.completions.create(
-                model=model,
-                messages=full_messages,
-                temperature=self._temperature,
-                top_p=self._top_p,
-                max_tokens=self._max_tokens,
-                stream=True,
-            )
-
             full_text = ""
             full_reasoning = ""
-            for chunk in stream:
-                delta = chunk.choices[0].delta
-                # ★ v2.2.2: 深度思考内容（如 DeepSeek R1 / o1 的 reasoning_content）
-                reasoning = getattr(delta, "reasoning_content", None)
-                if reasoning:
-                    full_reasoning += reasoning
-                    self._event_bus.publish(
-                        "ai:reasoning_chunk",
-                        {"text": reasoning},
-                        "AIClient",
-                    )
-                if delta.content:
-                    text = delta.content
-                    full_text += text
-                    self._event_bus.publish(
-                        "ai:response_chunk",
-                        {"text": text},
-                        "AIClient",
-                    )
-                    yield text
+            truncated = False  # ★ 最终是否仍处于截断状态
+            continue_count = 0  # ★ 已续写轮数
 
-            # 流结束
+            while True:
+                stream = client.chat.completions.create(
+                    model=model,
+                    messages=full_messages,
+                    temperature=self._temperature,
+                    top_p=self._top_p,
+                    max_tokens=self._max_tokens,
+                    stream=True,
+                )
+
+                round_text = ""
+                round_truncated = False
+                for chunk in stream:
+                    delta = chunk.choices[0].delta
+                    # ★ v2.2.2: 深度思考内容（如 DeepSeek R1 / o1 的 reasoning_content）
+                    reasoning = getattr(delta, "reasoning_content", None)
+                    if reasoning:
+                        full_reasoning += reasoning
+                        self._event_bus.publish(
+                            "ai:reasoning_chunk",
+                            {"text": reasoning},
+                            "AIClient",
+                        )
+                    if delta.content:
+                        text = delta.content
+                        round_text += text
+                        full_text += text
+                        self._event_bus.publish(
+                            "ai:response_chunk",
+                            {"text": text},
+                            "AIClient",
+                        )
+                        yield text
+                    # ★ 检测服务端停止原因：达到 max_tokens 上限会被标记为 "length"
+                    fr = getattr(chunk.choices[0], "finish_reason", None)
+                    if fr == "length":
+                        round_truncated = True
+
+                # 截断且开启自动续写且还有额度 → 续写
+                if (
+                    round_truncated
+                    and self._auto_continue
+                    and continue_count < self._max_continue_rounds
+                    and round_text
+                ):
+                    continue_count += 1
+                    self._logger.log(
+                        f"输出被截断，自动续写第 {continue_count}/{self._max_continue_rounds} 轮",
+                        "AIClient", "INFO",
+                    )
+                    self._event_bus.publish(
+                        "ai:continue",
+                        {"round": continue_count, "max_rounds": self._max_continue_rounds},
+                        "AIClient",
+                    )
+                    full_messages.append({"role": "assistant", "content": round_text})
+                    full_messages.append({
+                        "role": "user",
+                        "content": (
+                            "【自动续写】你刚才的回复因达到单次输出上限而被截断了，"
+                            f"截止到上一条消息末尾已生成：\n{round_text}\n\n"
+                            "请直接从上一条消息的末尾无缝继续，不要重复已输出的内容，"
+                            "也不要打招呼或说明，直接继续正文输出。"
+                        ),
+                    })
+                    continue  # 进入下一轮续写
+
+                # 续写耗尽或未截断 → 结束
+                truncated = round_truncated
+                break
+
             if full_reasoning:
                 self._event_bus.publish(
                     "ai:reasoning_end",
                     {"full_reasoning": full_reasoning},
                     "AIClient",
                 )
+            if truncated:
+                self._logger.log(
+                    f"输出达到 max_tokens 上限({self._max_tokens})被截断，"
+                    f"已输出 {len(full_text)} 字符"
+                    + (f"（已自动续写 {continue_count} 轮）" if continue_count else ""),
+                    "AIClient", "WARNING",
+                )
             self._event_bus.publish(
                 "ai:response_end",
-                {"full_text": full_text, "model": self._model, "reasoning": full_reasoning},
+                {"full_text": full_text, "model": self._model,
+                 "reasoning": full_reasoning, "truncated": truncated,
+                 "max_tokens": self._max_tokens,
+                 "continued_rounds": continue_count},
                 "AIClient",
             )
+            if truncated:
+                self._event_bus.publish(
+                    "ai:truncated",
+                    {"max_tokens": self._max_tokens, "length": len(full_text),
+                     "continued_rounds": continue_count},
+                    "AIClient",
+                )
 
         except APIConnectionError as e:
             self._event_bus.publish("ai:response_error", {"error": str(e)}, "AIClient")
@@ -647,13 +711,17 @@ class AIClient:
 
         final_answer = ""  # ★ 只记录最终纯文本回复；工具调用轮次的文本不进入最终答案
         full_reasoning = ""  # ★ v2.2.2 深度思考内容（跨轮次累积）
+        # ★ 自动续写状态：截断后自动续写剩余内容
+        continuation_mode = False  # 当前轮是否为续写轮（续写轮不再调用工具）
+        continue_count = 0         # 已续写轮数
         for _round in range(max_rounds):
             # 每轮都发送 tool definitions。
             # DeepSeek V4 的 DSML tool-calling 是有状态的：
             # 一旦触发工具调用，后续轮次若收不到 tools 定义，
             # 模型不会自动退出 tool-calling 模式，反而会基于
             # 上下文"脑补"不存在的工具名。
-            round_tools = tools if tools else None
+            # ★ 续写轮次强制不传 tools，确保模型只做纯文本续写。
+            round_tools = (None if continuation_mode else (tools if tools else None))
             try:
                 response = client.chat.completions.create(
                     model=model,
@@ -668,6 +736,7 @@ class AIClient:
                 # 收集完整响应
                 tool_calls_data = []
                 round_text = ""
+                round_truncated = False  # ★ 本轮是否因达到输出上限被截断
                 for chunk in response:
                     delta = chunk.choices[0].delta
 
@@ -685,6 +754,11 @@ class AIClient:
                     # 避免工具调用轮次的中间文本被当作独立消息显示（产生"两次消息"问题）
                     if delta.content:
                         round_text += delta.content
+
+                    # ★ 检测服务端停止原因：达到 max_tokens 上限会被标记为 "length"
+                    fr = getattr(chunk.choices[0], "finish_reason", None)
+                    if fr == "length":
+                        round_truncated = True
 
                     # 工具调用块
                     if delta.tool_calls:
@@ -743,8 +817,10 @@ class AIClient:
                     continue  # 继续下一轮对话
 
                 # ── 方案A：幻觉工具调用检测 ──
+                # ★ 续写轮跳过检测，避免把续写正文误判为工具调用而打断续写
                 if (
-                    self._fix_hallucinations
+                    not continuation_mode
+                    and self._fix_hallucinations
                     and round_text.strip()
                 ):
                     hallucinated = parse_hallucinated_tool_calls(
@@ -843,13 +919,65 @@ class AIClient:
 
                         continue  # 继续下一轮
 
-                # 纯文本回复，完成 —— 只此一条助手消息，统一作为最终答案展示
-                final_answer = round_text
+                # 纯文本回复（含自动续写拼接）
                 if final_answer:
+                    # ★ 续写轮：无缝拼接，避免产生第二条独立助手消息
+                    final_answer += round_text
+                else:
+                    final_answer = round_text
+
+                # 流式发布本轮新增内容
+                if round_text:
                     self._event_bus.publish(
-                        "ai:response_chunk", {"text": final_answer}, "AIClient"
+                        "ai:response_chunk", {"text": round_text}, "AIClient"
                     )
-                    yield {"type": "chunk", "content": final_answer}
+                    yield {"type": "chunk", "content": round_text}
+
+                # ★ 截断处理：若开启自动续写且还有额度，则让 AI 续写剩余内容
+                if (
+                    round_truncated
+                    and round_text
+                    and self._auto_continue
+                    and continue_count < self._max_continue_rounds
+                ):
+                    continue_count += 1
+                    self._logger.log(
+                        f"输出被截断，自动续写第 {continue_count}/{self._max_continue_rounds} 轮"
+                        f"（已拼 {len(final_answer)} 字符）",
+                        "AIClient", "INFO",
+                    )
+                    self._event_bus.publish(
+                        "ai:continue",
+                        {"round": continue_count, "max_rounds": self._max_continue_rounds},
+                        "AIClient",
+                    )
+                    # 把已生成部分作为 assistant 消息追加，保证上下文连贯
+                    if round_text:
+                        full_messages.append({
+                            "role": "assistant",
+                            "content": round_text,
+                        })
+                    # 追加续写指令
+                    full_messages.append({
+                        "role": "user",
+                        "content": (
+                            "【自动续写】你刚才的回复因达到单次输出上限而被截断了，"
+                            f"截止到上一条消息末尾已生成：\n{round_text}\n\n"
+                            "请直接从上一条消息的末尾无缝继续，不要重复已输出的内容，"
+                            "也不要打招呼或说明，直接继续正文输出。"
+                        ),
+                    })
+                    continuation_mode = True  # 续写轮不再触发工具调用
+                    continue  # 继续下一轮
+
+                # 正常结束（或已耗尽续写额度）
+                if round_truncated:
+                    self._logger.log(
+                        f"输出达到 max_tokens 上限({self._max_tokens})被截断，"
+                        f"已输出 {len(final_answer)} 字符"
+                        + (f"（已自动续写 {continue_count} 轮）" if continue_count else ""),
+                        "AIClient", "WARNING",
+                    )
                 if full_reasoning:
                     self._event_bus.publish(
                         "ai:reasoning_end",
@@ -858,9 +986,19 @@ class AIClient:
                     )
                 self._event_bus.publish(
                     "ai:response_end",
-                    {"full_text": final_answer, "model": self._model, "reasoning": full_reasoning},
+                    {"full_text": final_answer, "model": self._model,
+                     "reasoning": full_reasoning, "truncated": round_truncated,
+                     "max_tokens": self._max_tokens,
+                     "continued_rounds": continue_count},
                     "AIClient",
                 )
+                if round_truncated:
+                    self._event_bus.publish(
+                        "ai:truncated",
+                        {"max_tokens": self._max_tokens, "length": len(final_answer),
+                         "continued_rounds": continue_count},
+                        "AIClient",
+                    )
                 yield {"type": "done", "full_text": final_answer}
                 return
 
@@ -902,6 +1040,16 @@ class AIClient:
             enabled: True 启用自动修复（默认）
         """
         self._fix_hallucinations = enabled
+
+    def set_auto_continue(self, enabled: bool, max_rounds: int = 3) -> None:
+        """启用/禁用输出截断后的自动续写。
+
+        Args:
+            enabled: True 启用自动续写（默认关闭）
+            max_rounds: 单次对话最多自动续写轮数
+        """
+        self._auto_continue = bool(enabled)
+        self._max_continue_rounds = max(1, int(max_rounds))
 
     @property
     def hallucination_fix_enabled(self) -> bool:

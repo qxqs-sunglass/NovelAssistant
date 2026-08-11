@@ -123,6 +123,9 @@ class AppConfig:
     temperature: float = 1.0
     top_p: float = 0.9
     max_tokens: int = 2048
+    # ★ 输出截断自动续写
+    auto_continue: bool = True
+    max_continue_rounds: int = 3
     outline_expanded_ids: list[str] = field(default_factory=list)  # ★ 大纲展开节点
     # ★ v3修复: UI 状态保存
     last_panel_id: str = ""           # 上次打开的导航面板
@@ -155,6 +158,8 @@ class AppConfig:
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_tokens": self.max_tokens,
+            "auto_continue": self.auto_continue,
+            "max_continue_rounds": self.max_continue_rounds,
             "outline_expanded_ids": self.outline_expanded_ids,
             "last_panel_id": self.last_panel_id,
             "last_session_id": self.last_session_id,
@@ -185,6 +190,8 @@ class AppConfig:
             temperature=d.get("temperature", 1.0),
             top_p=d.get("top_p", 0.9),
             max_tokens=d.get("max_tokens", 2048),
+            auto_continue=d.get("auto_continue", True),
+            max_continue_rounds=d.get("max_continue_rounds", 3),
             outline_expanded_ids=d.get("outline_expanded_ids", []),
             last_panel_id=d.get("last_panel_id", ""),
             last_session_id=d.get("last_session_id", ""),
