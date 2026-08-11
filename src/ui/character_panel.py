@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QLineEdit, QLabel,
     QTextEdit, QPushButton, QScrollArea, QCheckBox,
+    QFormLayout,
 )
 from PySide6.QtCore import Qt
 
@@ -223,34 +224,132 @@ class CharacterPanel(BasePanel):
         self._refresh_list()
 
     def _show_camp_dialog(self):
+        """阵营管理对话框 — 列表 + 排序 + 增删改 + 自动关联当前角色（★ v3修复）"""
         cs = self._project_service.character_service
-        camps = cs.list_camps()
-        ch = cs.get_character(self._current_char_id) if self._current_char_id else None
-        current_ids = ch.camp_ids if ch else []
 
-        dlg = dialog_toplevel(self, "管理阵营", 300, 300)
+        dlg = dialog_toplevel(self, "管理阵营", 500, 420)
         layout = QVBoxLayout(dlg)
-        layout.addWidget(QLabel("选择角色所属阵营:"))
-        checks = {}
-        for c in camps:
-            cb = QCheckBox(c.name)
-            cb.setChecked(c.camp_id in current_ids)
-            checks[c.camp_id] = cb
-            layout.addWidget(cb)
+
+        # ── 列表区 + 排序按钮 ──
+        list_outer = QWidget()
+        lo = QHBoxLayout(list_outer)
+        lo.setContentsMargins(0, 0, 0, 0)
+        camp_list = QListWidget()
+        lo.addWidget(camp_list, 1)
+
+        order_side = QWidget()
+        ol = QVBoxLayout(order_side)
+        ol.setContentsMargins(4, 0, 0, 0)
+        up_btn = QPushButton("▲")
+        up_btn.clicked.connect(lambda: self._move_camp_dlg(camp_list, cs, -1))
+        down_btn = QPushButton("▼")
+        down_btn.clicked.connect(lambda: self._move_camp_dlg(camp_list, cs, 1))
+        ol.addWidget(up_btn)
+        ol.addWidget(down_btn)
+        ol.addStretch(1)
+        order_side.setLayout(ol)
+        lo.addWidget(order_side)
+        layout.addWidget(list_outer, 1)
+
+        # ── 编辑区 ──
+        edit = QWidget()
+        el = QFormLayout(edit)
+        name_edit = QLineEdit()
+        desc_edit = QLineEdit()
+        el.addRow("名称:", name_edit)
+        el.addRow("简介:", desc_edit)
+        layout.addWidget(edit)
+
+        def refresh_list():
+            camp_list.clear()
+            for c in cs.list_camps():
+                desc_preview = c.description[:30] + "..." if len(c.description) > 30 else c.description
+                camp_list.addItem(f"{c.name}  — {desc_preview}")
+
+        def on_select(item):
+            if item:
+                camps = cs.list_camps()
+                idx = camp_list.row(item)
+                if idx < len(camps):
+                    name_edit.setText(camps[idx].name)
+                    desc_edit.setText(camps[idx].description)
+
+        camp_list.currentItemChanged.connect(on_select)
+        refresh_list()
+
+        # ── 按钮区 ──
         btns = QHBoxLayout()
-        ok = QPushButton("确定")
-        cancel = QPushButton("取消")
+        save_btn = QPushButton("新建/更新")
+        delete_btn = QPushButton("🗑 删除")
+        close_btn = QPushButton("关闭")
 
         def do_save():
-            if self._current_char_id:
-                selected = [cid for cid, cb in checks.items() if cb.isChecked()]
-                cs.update_character(self._current_char_id, camp_ids=selected)
+            name = name_edit.text().strip()
+            if not name:
+                mb_warn(self, "提示", "请输入阵营名称")
+                return
+            try:
+                item = camp_list.currentItem()
+                camps = cs.list_camps()
+                if item and camp_list.row(item) < len(camps):
+                    cs.update_camp(camps[camp_list.row(item)].camp_id,
+                                   name=name, description=desc_edit.text())
+                else:
+                    new_camp = cs.create_camp(name, desc_edit.text())
+                    # ★ 自动关联当前角色
+                    if self._current_char_id:
+                        ch = cs.get_character(self._current_char_id)
+                        if ch and new_camp.camp_id not in ch.camp_ids:
+                            cs.update_character(self._current_char_id,
+                                                camp_ids=ch.camp_ids + [new_camp.camp_id])
+                refresh_list()
+                name_edit.clear()
+                desc_edit.clear()
                 self._refresh_camp_tags()
-                dlg.accept()
+                self._refresh_character_list()
+            except Exception as e:
+                mb_error(self, "错误", f"保存阵营失败: {e}")
 
-        ok.clicked.connect(do_save)
-        cancel.clicked.connect(dlg.reject)
-        btns.addWidget(ok)
-        btns.addWidget(cancel)
+        def do_delete():
+            item = camp_list.currentItem()
+            if item:
+                camps = cs.list_camps()
+                idx = camp_list.row(item)
+                if idx < len(camps) and mb_ask(self, "确认删除", f"确定要删除阵营「{camps[idx].name}」吗？"):
+                    try:
+                        cs.delete_camp(camps[idx].camp_id)
+                        refresh_list()
+                        self._refresh_camp_tags()
+                        self._refresh_character_list()
+                    except Exception as e:
+                        mb_error(self, "错误", f"删除阵营失败: {e}")
+
+        save_btn.clicked.connect(do_save)
+        delete_btn.clicked.connect(do_delete)
+        close_btn.clicked.connect(dlg.accept)
+        btns.addWidget(save_btn)
+        btns.addWidget(delete_btn)
+        btns.addStretch(1)
+        btns.addWidget(close_btn)
         layout.addLayout(btns)
         dlg.exec()
+
+    def _move_camp_dlg(self, camp_list, cs, delta: int):
+        """移动选中阵营的显示顺序（▲▼）"""
+        item = camp_list.currentItem()
+        if not item:
+            return
+        idx = camp_list.row(item)
+        new_idx = idx + delta
+        if new_idx < 0 or new_idx >= camp_list.count():
+            return
+        ids = [c.camp_id for c in cs.list_camps()]
+        ids[idx], ids[new_idx] = ids[new_idx], ids[idx]
+        cs.reorder_camps(ids)
+        camp_list.clear()
+        for c in cs.list_camps():
+            desc_preview = c.description[:30] + "..." if len(c.description) > 30 else c.description
+            camp_list.addItem(f"{c.name}  — {desc_preview}")
+        camp_list.setCurrentRow(new_idx)
+        self._refresh_camp_tags()
+        self._refresh_character_list()

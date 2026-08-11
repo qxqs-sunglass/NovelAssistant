@@ -2,11 +2,10 @@
 小说创作助手 v3.0 — 应用入口 (PySide6)
 
 组装所有模块依赖并启动应用窗口。
-★ v3修复: 数据根目录使用绝对路径（项目根/workspace），支持 NOVEL_WORKSPACE 环境变量覆盖，
-  保证与 v2 数据互通且不依赖启动时的工作目录。
+★ v3修复: 数据根目录固定为"程序所在目录/workspace"（源码运行=项目根，
+  打包运行=exe 同目录），不依赖启动时的工作目录。
 """
 import sys
-import os
 from pathlib import Path
 
 # 确保项目根目录在 sys.path 中
@@ -15,11 +14,19 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 
 def get_workspace_root() -> Path:
-    """数据根目录：NOVEL_WORKSPACE 环境变量优先，否则项目根/workspace"""
-    env = os.environ.get("NOVEL_WORKSPACE", "").strip()
-    if env:
-        return Path(env).resolve()
-    return PROJECT_ROOT / "workspace"
+    """数据根目录：固定使用程序所在目录下的 workspace
+
+    ★ PyInstaller 修复: 打包运行（sys.frozen）时 __file__ 指向 _internal/，
+      必须改用 sys.executable（exe 真实位置）作为基准，否则数据落在
+      _internal/workspace 而找不到 exe 同目录的 workspace。
+    """
+    if getattr(sys, "frozen", False):
+        # 打包运行：exe 所在目录
+        base = Path(sys.executable).resolve().parent
+    else:
+        # 源码运行：项目根
+        base = PROJECT_ROOT
+    return base / "workspace"
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
@@ -43,17 +50,23 @@ def main():
 
     # ── 基础设施层 ──
     ws = get_workspace_root()          # ★ v3修复: 绝对路径数据根
+    event_bus = EventBus()
     logger = Logger(log_dir=str(ws / "logs"))
+    logger.start()                     # ★ v3修复: 启动日志消费者线程（否则日志不写盘）
     config_manager = ConfigManager(config_dir=str(ws / "config"))
     logger.log(f"应用启动 v3.0 (PySide6)，数据根: {ws}", "App", "INFO")
 
     # ── 业务逻辑层 ──
     ai_client = AIClient(event_bus, logger)
     session_manager = SessionManager(str(ws / "sessions"), event_bus, logger)
-    project_service = ProjectService(str(ws / "projects"), event_bus, logger)
+    # ★ v3修复: ProjectService 接收 workspace 根（内部自动拼 /projects）
+    project_service = ProjectService(str(ws), event_bus, logger)
 
     # Configure AI client from saved settings
     _configure_ai_client(ai_client, config_manager, logger)
+
+    # ★ v3修复: 启动时自动切到上次使用的项目（v2 行为恢复）
+    _restore_last_project(project_service, config_manager, logger)
 
     # ── 工具注册 ──
     tool_registry = create_tools(project_service)
@@ -98,6 +111,29 @@ def _configure_ai_client(ai_client, config_manager, logger):
                 logger.log(f"AI 源已配置: {current_name}", "App", "INFO")
     except Exception as e:
         logger.log(f"AI 源配置失败: {e}", "App", "WARNING")
+
+
+def _restore_last_project(project_service, config_manager, logger):
+    """★ v3修复: 启动时恢复上次打开的项目（v2 行为）
+
+    若配置有 last_project 且该项目存在则切换；否则使用第一个项目。
+    """
+    try:
+        if not config_manager:
+            return
+        cfg = config_manager.load_app_config()
+        last = (getattr(cfg, "last_project", "") or "").strip()
+        if last and last in [p.name for p in project_service.list_projects()]:
+            project_service.switch_project(last)
+            logger.log(f"恢复上次项目: {last}", "App", "INFO")
+            return
+        # 否则切到第一个项目
+        projects = project_service.list_projects()
+        if projects:
+            project_service.switch_project(projects[0].name)
+            logger.log(f"切到首个项目: {projects[0].name}", "App", "INFO")
+    except Exception as e:
+        logger.log(f"恢复项目失败: {e}", "App", "WARNING")
 
 
 def _register_panels(window, event_bus, logger, ai_client,

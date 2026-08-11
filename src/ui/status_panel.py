@@ -71,11 +71,15 @@ class StatusPanel(BasePanel):
             return
         try:
             current = self._project_service.get_current_project()
-            nodes = self._project_service.get_outline_tree()
+            nodes = self._project_service.get_outline_tree() or []
             chars = self._project_service.character_service.list_characters()
             fs = self._project_service.foreshadow_service.list_foreshadows()
 
-            data = f"项目: {current}\n大纲节点数: {len(nodes) if nodes else 0}\n角色数: {len(chars)}\n伏笔数: {len(fs)}"
+            completed = sum(1 for n in nodes if getattr(n, "status", None) and n.status.value == "completed")
+            l5 = [n for n in nodes if getattr(n, "level", None) and n.level.value == 5]
+            word_count = sum(getattr(n, "word_count", 0) or 0 for n in l5)
+
+            data = f"项目: {current}\n大纲节点数: {len(nodes)}\n角色数: {len(chars)}\n伏笔数: {len(fs)}"
 
             template = "请基于以下项目数据生成一份创作状态报告。"
             if self._config_manager:
@@ -83,19 +87,28 @@ class StatusPanel(BasePanel):
                 t = getattr(cfg, 'status_prompt_template', '').strip()
                 if t:
                     template = t
-            template = template.replace("{project}", current or "").replace(
-                "{node_count}", str(len(nodes) if nodes else 0)).replace("{data}", data)
+            # ★ v3修复: 补全所有模板占位符
+            template = (template
+                        .replace("{project}", current or "")
+                        .replace("{node_count}", str(len(nodes)))
+                        .replace("{chapter_count}", str(len(l5)))
+                        .replace("{completed_count}", str(completed))
+                        .replace("{word_count:,}", f"{word_count:,}")
+                        .replace("{word_count}", str(word_count))
+                        .replace("{data}", data))
 
             from src.services.ai_client import ChatMessage
             msgs = [ChatMessage("user", template)]
             from threading import Thread
+            from PySide6.QtCore import QTimer
 
             def generate():
                 try:
                     resp = self._ai_client.chat(msgs, system_prompt="")
-                    self._status_text.setPlainText(resp.content)
+                    # ★ v3修复: Qt 控件必须在主线程更新，用 QTimer 调度回主线程
+                    QTimer.singleShot(0, lambda r=resp: self._status_text.setPlainText(r.content))
                 except Exception as e:
-                    self._status_text.setPlainText(f"生成失败: {e}")
+                    QTimer.singleShot(0, lambda e=e: self._status_text.setPlainText(f"生成失败: {e}"))
 
             Thread(target=generate, daemon=True).start()
         except Exception as e:

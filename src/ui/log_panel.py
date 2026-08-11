@@ -48,16 +48,19 @@ class LogPanel(BasePanel):
         self._load_history()
 
     def _load_history(self):
-        """加载最近的日志文件"""
-        log_dir = "workspace/logs"
+        """加载最近的日志文件（★ v3修复: Logger 按日期分目录，需递归收集）"""
+        log_dir = self._logger.log_dir if self._logger else "workspace/logs"
         self._all_lines = []
         try:
-            files = sorted(
-                [f for f in os.listdir(log_dir) if f.endswith(".log")],
-                reverse=True,
-            )
-            for fname in files[:5]:
-                with open(os.path.join(log_dir, fname), encoding="utf-8") as f:
+            # Logger 写入格式: <log_dir>/<日期>/<模块>.log → 递归收集
+            files = []
+            for root, _dirs, fnames in os.walk(log_dir):
+                for fn in fnames:
+                    if fn.endswith(".log"):
+                        files.append(os.path.join(root, fn))
+            files.sort(reverse=True)
+            for fp in files[:5]:
+                with open(fp, encoding="utf-8") as f:
                     for line in f:
                         self._all_lines.append(line.strip())
         except Exception:

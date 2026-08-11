@@ -113,17 +113,18 @@ class SettingsPanel(BasePanel):
     def _refresh_cats(self):
         self._cat_list.clear()
         for c in self._project_service.list_categories():
-            item = QListWidgetItem(c.name)
-            item.setData(Qt.ItemDataRole.UserRole, c.name)
+            # ★ v3修复: list_categories 返回字符串列表
+            item = QListWidgetItem(c)
+            item.setData(Qt.ItemDataRole.UserRole, c)
             self._cat_list.addItem(item)
 
     def _refresh_docs(self):
         self._doc_list.clear()
         if not self._current_cat:
             return
-        for d in self._project_service.list_settings(self._current_cat):
-            item = QListWidgetItem(d.name)
-            item.setData(Qt.ItemDataRole.UserRole, d.name)
+        for d in self._project_service.list_docs(self._current_cat):
+            item = QListWidgetItem(d)
+            item.setData(Qt.ItemDataRole.UserRole, d)
             self._doc_list.addItem(item)
 
     def _on_cat_selected(self, item):
@@ -137,8 +138,9 @@ class SettingsPanel(BasePanel):
         self._save_doc()
         self._current_doc = item.data(Qt.ItemDataRole.UserRole) if item else None
         if self._current_doc and self._current_cat:
-            doc = self._project_service.get_setting(self._current_cat, self._current_doc)
-            self._editor.setPlainText(doc.content if doc else "")
+            # ★ v3修复: get_setting 直接返回内容字符串
+            content = self._project_service.get_setting(self._current_cat, self._current_doc) or ""
+            self._editor.setPlainText(content)
             self._content_modified = False
         else:
             self._editor.clear()
@@ -161,7 +163,8 @@ class SettingsPanel(BasePanel):
 
     def _do_create_cat(self, name, dlg):
         if name:
-            self._project_service.create_category(name)
+            # ★ v3修复: service 无 create_category，用 v2 同款占位文件方式
+            self._project_service.save_setting(name, "_placeholder", "")
             self._refresh_cats()
             dlg.accept()
 
@@ -201,16 +204,18 @@ class SettingsPanel(BasePanel):
 
     def _do_create_doc(self, name, dlg):
         if name and self._current_cat:
-            self._project_service.create_setting(self._current_cat, name)
+            # ★ v3修复: 用 save_setting 创建文档（含初始标题）
+            self._project_service.save_setting(self._current_cat, name, f"# {name}")
             self._refresh_docs()
             dlg.accept()
 
     def _save_doc(self):
         if not self._current_cat or not self._current_doc or not self._content_modified:
             return
-        self._project_service.update_setting(
+        # ★ v3修复: 用 save_setting 保存内容
+        self._project_service.save_setting(
             self._current_cat, self._current_doc,
-            content=self._editor.toPlainText(),
+            self._editor.toPlainText(),
         )
         self._content_modified = False
 
@@ -227,10 +232,10 @@ class SettingsPanel(BasePanel):
             return
         out = []
         for c in self._project_service.list_categories():
-            out.append(f"# {c.name}")
-            for d in self._project_service.list_settings(c.name):
-                out.append(f"## {d.name}")
-                out.append(d.content or "")
+            out.append(f"# {c}")
+            for d in self._project_service.list_docs(c):
+                out.append(f"## {d}")
+                out.append(self._project_service.get_setting(c, d) or "")
                 out.append("")
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(out))
