@@ -83,7 +83,7 @@ class AISourceConfig:
 @dataclass
 class AppConfig:
     """应用全局配置"""
-    version: str = "2.2.2"
+    version: str = "3.0.0"
     language: str = "zh-CN"
     window_width: int = 1200
     window_height: int = 700
@@ -120,6 +120,9 @@ class AppConfig:
         "4. 使用伏笔工具，对已有的伏笔进行增删。"
     )
     outline_expanded_ids: list[str] = field(default_factory=list)  # ★ 大纲展开节点
+    # ★ v3修复: UI 状态保存
+    last_panel_id: str = ""           # 上次打开的导航面板
+    last_session_id: str = ""         # 上次打开的对话会话
     ai_sources: list[AISourceConfig] = field(default_factory=list)
 
     @staticmethod
@@ -146,6 +149,8 @@ class AppConfig:
             "status_prompt_template": self.status_prompt_template,
             "chat_skill_text": self.chat_skill_text,
             "outline_expanded_ids": self.outline_expanded_ids,
+            "last_panel_id": self.last_panel_id,
+            "last_session_id": self.last_session_id,
             "ai_sources": [s.to_dict() for s in self.ai_sources],
         }
 
@@ -171,6 +176,8 @@ class AppConfig:
             status_prompt_template=d.get("status_prompt_template", AppConfig.status_prompt_template),
             chat_skill_text=d.get("chat_skill_text", AppConfig.chat_skill_text),
             outline_expanded_ids=d.get("outline_expanded_ids", []),
+            last_panel_id=d.get("last_panel_id", ""),
+            last_session_id=d.get("last_session_id", ""),
             ai_sources=sources,
         )
 

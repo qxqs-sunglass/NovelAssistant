@@ -7,6 +7,7 @@ v2.2: 统一 fetch 工具取代独立 read 工具，支持批量读取
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional, Callable
 from dataclasses import dataclass
 
@@ -251,6 +252,13 @@ def create_tools(project_service) -> ToolRegistry:
         description="添加新伏笔条目",
         parameters={"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]},
         handler=lambda args: {"created": project_service.foreshadow_service.add_foreshadow(args["content"]).foreshadow_id}))
+    registry.register(ToolDef(name="delete_foreshadow",
+        description="删除伏笔条目（传入伏笔 ID，可用 list_foreshadows 获取）",
+        parameters={"type": "object", "properties": {"foreshadow_id": {"type": "string"}}, "required": ["foreshadow_id"]},
+        handler=lambda args: (
+            project_service.foreshadow_service.delete_foreshadow(args["foreshadow_id"])
+            or {"deleted": args["foreshadow_id"]}
+        )))
 
     # ── 状态 ──
     registry.register(ToolDef(name="get_status",
@@ -264,4 +272,30 @@ def create_tools(project_service) -> ToolRegistry:
             "total_words": sum(n.word_count for n in project_service.get_nodes_by_level(OutlineLevel.CONTENT)),
         }}))
 
+    # ── 字数统计 ★ v3 ──
+    registry.register(ToolDef(name="count_words",
+        description="统计文本字数。中文按字计、英文按空格分词计、标点各计一字。返回 {total, chinese, english}。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "待统计的文本内容"},
+            },
+            "required": ["text"],
+        },
+        handler=lambda args: _count_words(args.get("text", ""))))
+
     return registry
+
+
+def _count_words(text: str) -> dict:
+    """字数统计实现 — 中文按字、英文按空格分词、标点各计一字（v3）"""
+    if not text:
+        return {"total": 0, "chinese": 0, "english": 0}
+    # 中文字符
+    chinese = len(re.findall(r'[\u4e00-\u9fff]', text))
+    # 英文/数字词：先剔除中文字符，再按空白分词
+    non_cjk = re.sub(r'[\u4e00-\u9fff]', ' ', text)
+    english = len([w for w in non_cjk.split() if w.strip()])
+    # 标点符号（非中文、非字母数字、非空白）
+    punct = len(re.findall(r'[^\u4e00-\u9fff\w\s]', text))
+    return {"total": chinese + english + punct, "chinese": chinese, "english": english + punct}

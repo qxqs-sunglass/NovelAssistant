@@ -1,0 +1,256 @@
+"""角色面板 — 列表 + 字段 + MD 简介 + 阵营标签（v3.0）"""
+import json
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
+    QListWidget, QListWidgetItem, QLineEdit, QLabel,
+    QTextEdit, QPushButton, QScrollArea, QCheckBox,
+)
+from PySide6.QtCore import Qt
+
+from src.ui.base_panel import BasePanel
+from src.ui.common import mb_error, mb_ask, mb_warn, dialog_toplevel
+
+
+class CharacterPanel(BasePanel):
+    """角色管理面板"""
+
+    def __init__(self, event_bus, logger, project_service):
+        self._project_service = project_service
+        self._current_char_id: str | None = None
+        self._bio_modified = False
+        super().__init__(event_bus, logger)
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: character list
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        self._char_list = QListWidget()
+        self._char_list.currentItemChanged.connect(self._on_char_selected)
+        ll.addWidget(self._char_list)
+        btns = QHBoxLayout()
+        new_btn = QPushButton("+ 创建")
+        new_btn.clicked.connect(self._create_character)
+        del_btn = QPushButton("🗑 删除")
+        del_btn.clicked.connect(self._delete_character)
+        btns.addWidget(new_btn)
+        btns.addWidget(del_btn)
+        ll.addLayout(btns)
+        splitter.addWidget(left)
+
+        # Right: fields + bio
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(4, 4, 4, 4)
+
+        # Fields
+        form = QHBoxLayout()
+        self._name_edit = QLineEdit()
+        self._name_edit.setPlaceholderText("姓名")
+        self._gender_edit = QLineEdit()
+        self._gender_edit.setPlaceholderText("性别")
+        self._age_edit = QLineEdit()
+        self._age_edit.setPlaceholderText("年龄")
+        self._birthday_edit = QLineEdit()
+        self._birthday_edit.setPlaceholderText("生日")
+        for e in [self._name_edit, self._gender_edit, self._age_edit, self._birthday_edit]:
+            e.editingFinished.connect(self._save_fields)
+        form.addWidget(QLabel("姓名:"))
+        form.addWidget(self._name_edit)
+        form.addWidget(QLabel("性别:"))
+        form.addWidget(self._gender_edit)
+        form.addWidget(QLabel("年龄:"))
+        form.addWidget(self._age_edit)
+        form.addWidget(QLabel("生日:"))
+        form.addWidget(self._birthday_edit)
+        rl.addLayout(form)
+
+        # Bio
+        rl.addWidget(QLabel("简介 (Markdown):"))
+        self._bio_edit = QTextEdit()
+        self._bio_edit.textChanged.connect(lambda: setattr(self, '_bio_modified', True))
+        rl.addWidget(self._bio_edit)
+
+        # Save bio button
+        save_btn = QPushButton("💾 保存简介")
+        save_btn.clicked.connect(self._save_bio)
+        rl.addWidget(save_btn)
+
+        rl.addWidget(QLabel("阵营:"))
+        self._camp_tags = QLabel("无")
+        self._camp_tags.setWordWrap(True)
+        rl.addWidget(self._camp_tags)
+        camp_btn = QPushButton("管理阵营")
+        camp_btn.clicked.connect(self._show_camp_dialog)
+        rl.addWidget(camp_btn)
+        rl.addStretch()
+
+        splitter.addWidget(right)
+        splitter.setSizes([200, 500])
+        layout.addWidget(splitter, 1)
+
+    def _subscribe_events(self):
+        self._event_bus.subscribe("character:created", lambda e: self._refresh_list())
+        self._event_bus.subscribe("character:updated", lambda e: self._refresh_list())
+        self._event_bus.subscribe("character:deleted", lambda e: self._on_char_deleted())
+        self._event_bus.subscribe("camp:created", lambda e: self._refresh_all())
+        self._event_bus.subscribe("camp:updated", lambda e: self._refresh_all())
+        self._event_bus.subscribe("camp:deleted", lambda e: self._refresh_all())
+
+    def on_show(self):
+        self._refresh_all()
+
+    def _refresh_all(self):
+        self._refresh_list()
+
+    def _refresh_list(self):
+        cs = self._project_service.character_service
+        chars = cs.list_characters()
+        self._char_list.clear()
+        for ch in sorted(chars, key=lambda c: c.name):
+            item = QListWidgetItem(ch.name)
+            item.setData(Qt.ItemDataRole.UserRole, ch.char_id)
+            self._char_list.addItem(item)
+
+    def _on_char_selected(self, item):
+        if not item:
+            return
+        self._save_fields()
+        self._save_bio()
+        cid = item.data(Qt.ItemDataRole.UserRole)
+        self._current_char_id = cid
+        ch = self._project_service.character_service.get_character(cid)
+        if not ch:
+            return
+        self._name_edit.setText(ch.name)
+        self._gender_edit.setText(ch.gender or "")
+        self._age_edit.setText(ch.age or "")
+        self._birthday_edit.setText(ch.birthday or "")
+        self._bio_edit.setPlainText(ch.bio or "")
+        self._bio_modified = False
+        self._refresh_camp_tags()
+
+    def _refresh_camp_tags(self):
+        if not self._current_char_id:
+            return
+        ch = self._project_service.character_service.get_character(self._current_char_id)
+        if not ch or not ch.camp_ids:
+            self._camp_tags.setText("无")
+            return
+        camps = []
+        for cid in ch.camp_ids:
+            c = self._project_service.character_service.get_camp(cid)
+            if c:
+                camps.append(c.name)
+        self._camp_tags.setText(", ".join(camps) if camps else "无")
+
+    def _save_fields(self):
+        if not self._current_char_id:
+            return
+        name = self._name_edit.text().strip()
+        if not name:
+            return
+        try:
+            self._project_service.character_service.update_character(
+                self._current_char_id, name=name,
+                gender=self._gender_edit.text().strip(),
+                age=self._age_edit.text().strip(),
+                birthday=self._birthday_edit.text().strip(),
+            )
+        except Exception as e:
+            mb_error(self, "错误", str(e))
+
+    def _save_bio(self):
+        if not self._current_char_id or not self._bio_modified:
+            return
+        try:
+            self._project_service.character_service.update_character(
+                self._current_char_id, bio=self._bio_edit.toPlainText(),
+            )
+            self._bio_modified = False
+        except Exception as e:
+            mb_error(self, "错误", str(e))
+
+    def _create_character(self):
+        dlg = dialog_toplevel(self, "创建角色", 300, 120)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("角色名称:"))
+        entry = QLineEdit()
+        lay.addWidget(entry)
+        btns = QHBoxLayout()
+        ok = QPushButton("创建")
+        cancel = QPushButton("取消")
+
+        def do_create():
+            name = entry.text().strip()
+            if name:
+                try:
+                    self._project_service.character_service.create_character(name)
+                    self._refresh_list()
+                    dlg.accept()
+                except ValueError as e:
+                    mb_error(self, "错误", str(e))
+
+        ok.clicked.connect(do_create)
+        cancel.clicked.connect(dlg.reject)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+        dlg.exec()
+
+    def _delete_character(self):
+        if not self._current_char_id:
+            return
+        ch = self._project_service.character_service.get_character(self._current_char_id)
+        if ch and mb_ask(self, "确认删除", f"确定删除角色「{ch.name}」？"):
+            try:
+                self._project_service.character_service.delete_character(self._current_char_id)
+                self._current_char_id = None
+                self._refresh_list()
+            except Exception as e:
+                mb_error(self, "错误", str(e))
+
+    def _on_char_deleted(self):
+        if self._current_char_id:
+            ch = self._project_service.character_service.get_character(self._current_char_id)
+            if not ch:
+                self._current_char_id = None
+        self._refresh_list()
+
+    def _show_camp_dialog(self):
+        cs = self._project_service.character_service
+        camps = cs.list_camps()
+        ch = cs.get_character(self._current_char_id) if self._current_char_id else None
+        current_ids = ch.camp_ids if ch else []
+
+        dlg = dialog_toplevel(self, "管理阵营", 300, 300)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("选择角色所属阵营:"))
+        checks = {}
+        for c in camps:
+            cb = QCheckBox(c.name)
+            cb.setChecked(c.camp_id in current_ids)
+            checks[c.camp_id] = cb
+            layout.addWidget(cb)
+        btns = QHBoxLayout()
+        ok = QPushButton("确定")
+        cancel = QPushButton("取消")
+
+        def do_save():
+            if self._current_char_id:
+                selected = [cid for cid, cb in checks.items() if cb.isChecked()]
+                cs.update_character(self._current_char_id, camp_ids=selected)
+                self._refresh_camp_tags()
+                dlg.accept()
+
+        ok.clicked.connect(do_save)
+        cancel.clicked.connect(dlg.reject)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        layout.addLayout(btns)
+        dlg.exec()
