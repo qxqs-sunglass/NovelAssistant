@@ -261,4 +261,24 @@ QCheckBox::indicator, QRadioButton::indicator {
     width: 16px;
     height: 16px;
 }
+
+/* ── 树内复选框（勾选面板） ── */
+QTreeWidget::indicator {
+    width: 18px;
+    height: 18px;
+    border: 2px solid #6b7280;
+    border-radius: 4px;
+    background-color: #ffffff;
+}
+QTreeWidget::indicator:unchecked:hover {
+    border-color: #1d4ed8;
+}
+QTreeWidget::indicator:checked {
+    background-color: #1d4ed8;
+    border-color: #1d4ed8;
+}
+QTreeWidget::indicator:hover:checked {
+    background-color: #1e40af;
+    border-color: #1e40af;
+}
 """

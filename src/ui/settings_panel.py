@@ -63,6 +63,16 @@ class SettingsPanel(BasePanel):
         b1.addWidget(ren_cat)
         b1.addWidget(del_cat)
         ll.addLayout(b1)
+        # ★ v3补齐: 分类排序
+        b1_sort = QHBoxLayout()
+        cat_up = QPushButton("▲ 上移")
+        cat_up.clicked.connect(self._move_cat_up)
+        cat_down = QPushButton("▼ 下移")
+        cat_down.clicked.connect(self._move_cat_down)
+        b1_sort.addWidget(cat_up)
+        b1_sort.addWidget(cat_down)
+        b1_sort.addStretch()
+        ll.addLayout(b1_sort)
         splitter.addWidget(left)
 
         # Middle: docs
@@ -76,11 +86,23 @@ class SettingsPanel(BasePanel):
         b2 = QHBoxLayout()
         new_doc = QPushButton("+ 新建")
         new_doc.clicked.connect(self._create_doc)
+        ren_doc = QPushButton("重命名")
+        ren_doc.clicked.connect(self._rename_doc_btn)
         del_doc = QPushButton("🗑 删除")
         del_doc.clicked.connect(self._delete_doc)
         b2.addWidget(new_doc)
+        b2.addWidget(ren_doc)
         b2.addWidget(del_doc)
         ml.addLayout(b2)
+        b2_sort = QHBoxLayout()
+        doc_up = QPushButton("▲ 上移")
+        doc_up.clicked.connect(self._move_doc_up)
+        doc_down = QPushButton("▼ 下移")
+        doc_down.clicked.connect(self._move_doc_down)
+        b2_sort.addWidget(doc_up)
+        b2_sort.addWidget(doc_down)
+        b2_sort.addStretch()
+        ml.addLayout(b2_sort)
         splitter.addWidget(mid)
 
         # Right: editor
@@ -103,6 +125,17 @@ class SettingsPanel(BasePanel):
 
         splitter.setSizes([180, 180, 400])
         layout.addWidget(splitter, 1)
+
+    def _subscribe_events(self):
+        # ★ v3补齐: 项目切换时自动保存并清空编辑器
+        self._event_bus.subscribe("project:switched", lambda e: self._on_project_switched())
+
+    def _on_project_switched(self):
+        self._save_doc()
+        self._current_cat = None
+        self._current_doc = None
+        self._editor.clear()
+        self._content_modified = False
 
     def on_show(self):
         self._refresh_cats()
@@ -225,6 +258,96 @@ class SettingsPanel(BasePanel):
             self._current_doc = None
             self._editor.clear()
             self._refresh_docs()
+
+    # ── ★ v3补齐: 分类/文档排序与文档重命名 ──
+
+    def _move_cat_up(self):
+        """分类上移一位"""
+        item = self._cat_list.currentItem()
+        if not item:
+            return
+        idx = self._cat_list.row(item)
+        if idx <= 0:
+            return
+        cats = [self._cat_list.item(i).text() for i in range(self._cat_list.count())]
+        cats[idx], cats[idx - 1] = cats[idx - 1], cats[idx]
+        self._project_service.reorder_categories(cats)
+        self._refresh_cats()
+        self._cat_list.setCurrentRow(idx - 1)
+
+    def _move_cat_down(self):
+        """分类下移一位"""
+        item = self._cat_list.currentItem()
+        if not item:
+            return
+        idx = self._cat_list.row(item)
+        cats = [self._cat_list.item(i).text() for i in range(self._cat_list.count())]
+        if idx >= len(cats) - 1:
+            return
+        cats[idx], cats[idx + 1] = cats[idx + 1], cats[idx]
+        self._project_service.reorder_categories(cats)
+        self._refresh_cats()
+        self._cat_list.setCurrentRow(idx + 1)
+
+    def _rename_doc_btn(self):
+        """按钮触发文档重命名"""
+        item = self._doc_list.currentItem()
+        if not item or not self._current_cat:
+            mb_info(self, "提示", "请先选择一个文档")
+            return
+        old_name = item.text()
+        dlg = dialog_toplevel(self, "重命名文档", 300, 120)
+        l = QVBoxLayout(dlg)
+        l.addWidget(QLabel("新名称:"))
+        e = QLineEdit(old_name)
+        l.addWidget(e)
+        btns = QHBoxLayout()
+        ok = QPushButton("确定")
+        cancel = QPushButton("取消")
+
+        def do_rename():
+            new_name = e.text().strip()
+            if new_name and new_name != old_name:
+                self._project_service.rename_setting(self._current_cat, old_name, new_name)
+                if self._current_doc == old_name:
+                    self._current_doc = new_name
+                self._refresh_docs()
+                dlg.accept()
+
+        ok.clicked.connect(do_rename)
+        cancel.clicked.connect(dlg.reject)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        l.addLayout(btns)
+        dlg.exec()
+
+    def _move_doc_up(self):
+        """文档上移一位"""
+        item = self._doc_list.currentItem()
+        if not item or not self._current_cat:
+            return
+        idx = self._doc_list.row(item)
+        if idx <= 0:
+            return
+        docs = [self._doc_list.item(i).text() for i in range(self._doc_list.count())]
+        docs[idx], docs[idx - 1] = docs[idx - 1], docs[idx]
+        self._project_service.reorder_docs(self._current_cat, docs)
+        self._refresh_docs()
+        self._doc_list.setCurrentRow(idx - 1)
+
+    def _move_doc_down(self):
+        """文档下移一位"""
+        item = self._doc_list.currentItem()
+        if not item or not self._current_cat:
+            return
+        idx = self._doc_list.row(item)
+        docs = [self._doc_list.item(i).text() for i in range(self._doc_list.count())]
+        if idx >= len(docs) - 1:
+            return
+        docs[idx], docs[idx + 1] = docs[idx + 1], docs[idx]
+        self._project_service.reorder_docs(self._current_cat, docs)
+        self._refresh_docs()
+        self._doc_list.setCurrentRow(idx + 1)
 
     def _export_all(self):
         path, _ = QFileDialog.getSaveFileName(self, "导出设定", "", "Markdown (*.md)")

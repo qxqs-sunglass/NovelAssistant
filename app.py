@@ -1,11 +1,8 @@
 """
 小说创作助手 v3.0 — 应用入口 (PySide6)
-
-组装所有模块依赖并启动应用窗口。
-★ v3修复: 数据根目录固定为"程序所在目录/workspace"（源码运行=项目根，
-  打包运行=exe 同目录），不依赖启动时的工作目录。
 """
 import sys
+import threading
 from pathlib import Path
 
 # 确保项目根目录在 sys.path 中
@@ -14,11 +11,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 
 def get_workspace_root() -> Path:
-    """数据根目录：固定使用程序所在目录下的 workspace
-
-    ★ PyInstaller 修复: 打包运行（sys.frozen）时 __file__ 指向 _internal/，
-      必须改用 sys.executable（exe 真实位置）作为基准，否则数据落在
-      _internal/workspace 而找不到 exe 同目录的 workspace。
+    """
+    数据根目录：固定使用程序所在目录下的 workspace
     """
     if getattr(sys, "frozen", False):
         # 打包运行：exe 所在目录
@@ -29,10 +23,9 @@ def get_workspace_root() -> Path:
     return base / "workspace"
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt
 
 from src.core.event_bus import EventBus
-from src.core.logger import Logger
+from src.core.logger import get_logger
 from src.core.config_manager import ConfigManager
 from src.services.ai_client import AIClient
 from src.services.session_manager import SessionManager
@@ -51,9 +44,12 @@ def main():
     # ── 基础设施层 ──
     ws = get_workspace_root()          # ★ v3修复: 绝对路径数据根
     event_bus = EventBus()
-    logger = Logger(log_dir=str(ws / "logs"))
-    logger.start()                     # ★ v3修复: 启动日志消费者线程（否则日志不写盘）
+    # ★ v3修复: 统一通过 get_logger() 获取全局单例，避免 ConfigManager 内部
+    # get_logger() 再创建一个重复实例（此前会出现两个日志线程）
+    logger = get_logger(log_dir=str(ws / "logs"))
     config_manager = ConfigManager(config_dir=str(ws / "config"))
+    # ★ v3性能优化: 后台预热加密密钥，避免首次打开配置界面时因 wmic 查询卡顿
+    threading.Thread(target=config_manager.prewarm_key, daemon=True).start()
     logger.log(f"应用启动 v3.0 (PySide6)，数据根: {ws}", "App", "INFO")
 
     # ── 业务逻辑层 ──
@@ -92,23 +88,26 @@ def main():
 
 
 def _configure_ai_client(ai_client, config_manager, logger):
-    """从配置加载当前 AI 源并配置 AIClient"""
+    """从配置加载当前 AI 源并配置 AIClient
+
+    ★ v3修复: 原实现误把 get_current_ai_source() 的返回值（AISourceConfig 对象）
+    当作源名称传给 get_ai_source()，导致重新打开软件后 AI 源始终无法正确加载、
+    对话显示"AI 未配置"。此处直接使用返回的配置对象。
+    """
     try:
-        current_name = config_manager.get_current_ai_source()
-        if current_name:
-            source = config_manager.get_ai_source(current_name)
-            if source:
-                api_key = config_manager.get_api_key(current_name) or ""
-                ai_client.configure(
-                    base_url=source.base_url,
-                    api_key=api_key,
-                    model=source.model,
-                    model_minor=source.model_minor,
-                    temperature=source.temperature,
-                    top_p=source.top_p,
-                    max_tokens=source.max_tokens,
-                )
-                logger.log(f"AI 源已配置: {current_name}", "App", "INFO")
+        source = config_manager.get_current_ai_source()
+        if source:
+            api_key = config_manager.get_api_key(source.name) or ""
+            ai_client.configure(
+                base_url=source.base_url,
+                api_key=api_key,
+                model=source.model,
+                model_minor=source.model_minor,
+                temperature=source.temperature,
+                top_p=source.top_p,
+                max_tokens=source.max_tokens,
+            )
+            logger.log(f"AI 源已配置: {source.name}", "App", "INFO")
     except Exception as e:
         logger.log(f"AI 源配置失败: {e}", "App", "WARNING")
 

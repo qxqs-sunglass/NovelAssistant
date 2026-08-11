@@ -26,7 +26,7 @@ class LogPanel(BasePanel):
         tb = QHBoxLayout()
         tb.addWidget(QLabel("级别:"))
         self._filter = QComboBox()
-        self._filter.addItems(["ALL", "INFO", "WARNING", "ERROR"])
+        self._filter.addItems(["ALL", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
         self._filter.currentTextChanged.connect(self._apply_filter)
         tb.addWidget(self._filter)
         tb.addStretch()

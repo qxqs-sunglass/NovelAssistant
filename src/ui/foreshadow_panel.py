@@ -149,3 +149,10 @@ class ForeshadowPanel(BasePanel):
         if mb_ask(self, "确认", "确定要删除这条伏笔吗？"):
             self._project_service.foreshadow_service.delete_foreshadow(fid)
             self._refresh_list()
+
+    def get_ai_context(self) -> str:
+        """供 ChatPanel 调用：获取未隐藏伏笔的格式化文本"""
+        try:
+            return self._project_service.foreshadow_service.get_ai_context()
+        except Exception:
+            return ""

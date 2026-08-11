@@ -86,8 +86,8 @@ class ReasoningWindow:
         hdr_layout.addWidget(self._header)
         hdr_layout.addStretch()
         hdr_layout.addWidget(close_btn)
-        # Replace header in layout
-        layout.itemAt(0).widget().setParent(None)
+        # ★ v3修复: header 已被 hdr_layout 接管（addWidget 自动移出原布局），
+        # 原代码 layout.itemAt(0) 此时为 None 导致崩溃，已移除
         hdr_widget = QWidget()
         hdr_widget.setLayout(hdr_layout)
         hdr_widget.setStyleSheet("background:#fff7e6;")

@@ -1,5 +1,6 @@
 """角色面板 — 列表 + 字段 + MD 简介 + 阵营标签（v3.0）"""
 import json
+import shiboken6
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QLineEdit, QLabel,
@@ -110,20 +111,56 @@ class CharacterPanel(BasePanel):
         self._refresh_list()
 
     def _refresh_list(self):
+        # ★ v3修复: 重建列表前先记住滚动位置与当前选中项，重建后恢复，
+        # 避免 clear() 导致滚动条跳回顶部、选中项错乱
+        scroll = self._char_list.verticalScrollBar()
+        prev_scroll = scroll.value() if scroll else 0
+        prev_current = None
+        if self._current_char_id:
+            item = self._char_list.currentItem()
+            prev_current = item.data(Qt.ItemDataRole.UserRole) if item else None
+        else:
+            prev_current = None
+
         cs = self._project_service.character_service
         chars = cs.list_characters()
-        self._char_list.clear()
-        for ch in sorted(chars, key=lambda c: c.name):
-            item = QListWidgetItem(ch.name)
-            item.setData(Qt.ItemDataRole.UserRole, ch.char_id)
-            self._char_list.addItem(item)
+        self._char_list.blockSignals(True)  # 重建期间屏蔽信号，避免 currentItemChanged 误触发
+        try:
+            self._char_list.clear()
+            for ch in sorted(chars, key=lambda c: c.name):
+                item = QListWidgetItem(ch.name)
+                item.setData(Qt.ItemDataRole.UserRole, ch.char_id)
+                self._char_list.addItem(item)
+        finally:
+            self._char_list.blockSignals(False)
+
+        # 恢复选中项（优先保留之前的 current_char_id；否则回退到重建前的选中项）
+        restore_id = self._current_char_id or prev_current
+        if restore_id:
+            for i in range(self._char_list.count()):
+                it = self._char_list.item(i)
+                if it and it.data(Qt.ItemDataRole.UserRole) == restore_id:
+                    self._char_list.setCurrentItem(it)
+                    break
+
+        # 恢复滚动位置
+        if scroll:
+            scroll.setValue(prev_scroll)
 
     def _on_char_selected(self, item):
-        if not item:
+        # ★ v3修复: item 可能在信号回调中已被 clear() 删除（内部 C++ 对象失效），
+        # 需先用 shiboken6 校验有效性，避免 "Internal C++ object already deleted"
+        if not item or not shiboken6.isValid(item):
             return
+        # 先读取 cid —— 必须在任何可能触发列表重建（update_character → character:updated
+        # → _refresh_list → clear）的操作之前完成，否则后续 item 会失效
+        cid = item.data(Qt.ItemDataRole.UserRole)
+        if not cid:
+            return
+        # 保存上一个角色的未保存改动（此时 _current_char_id 仍指向旧角色）
         self._save_fields()
         self._save_bio()
-        cid = item.data(Qt.ItemDataRole.UserRole)
+        # 切换到新角色
         self._current_char_id = cid
         ch = self._project_service.character_service.get_character(cid)
         if not ch:
@@ -156,12 +193,26 @@ class CharacterPanel(BasePanel):
         name = self._name_edit.text().strip()
         if not name:
             return
+        ch = self._project_service.character_service.get_character(self._current_char_id)
+        new_name = name
+        new_gender = self._gender_edit.text().strip()
+        new_age = self._age_edit.text().strip()
+        new_birthday = self._birthday_edit.text().strip()
+        # ★ v3修复: 字段无变化时跳过保存，避免每次都发布 character:updated
+        # 事件导致列表被无谓重建（滚动条跳回顶部 / 选中项错乱）
+        if ch and (
+            ch.name == new_name
+            and (ch.gender or "") == new_gender
+            and (ch.age or "") == new_age
+            and (ch.birthday or "") == new_birthday
+        ):
+            return
         try:
             self._project_service.character_service.update_character(
-                self._current_char_id, name=name,
-                gender=self._gender_edit.text().strip(),
-                age=self._age_edit.text().strip(),
-                birthday=self._birthday_edit.text().strip(),
+                self._current_char_id, name=new_name,
+                gender=new_gender,
+                age=new_age,
+                birthday=new_birthday,
             )
         except Exception as e:
             mb_error(self, "错误", str(e))
@@ -306,7 +357,7 @@ class CharacterPanel(BasePanel):
                 name_edit.clear()
                 desc_edit.clear()
                 self._refresh_camp_tags()
-                self._refresh_character_list()
+                self._refresh_list()
             except Exception as e:
                 mb_error(self, "错误", f"保存阵营失败: {e}")
 
@@ -320,7 +371,7 @@ class CharacterPanel(BasePanel):
                         cs.delete_camp(camps[idx].camp_id)
                         refresh_list()
                         self._refresh_camp_tags()
-                        self._refresh_character_list()
+                        self._refresh_list()
                     except Exception as e:
                         mb_error(self, "错误", f"删除阵营失败: {e}")
 
@@ -352,4 +403,4 @@ class CharacterPanel(BasePanel):
             camp_list.addItem(f"{c.name}  — {desc_preview}")
         camp_list.setCurrentRow(new_idx)
         self._refresh_camp_tags()
-        self._refresh_character_list()
+        self._refresh_list()

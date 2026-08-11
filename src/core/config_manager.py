@@ -119,6 +119,10 @@ class AppConfig:
         "3. 分析伏笔条目，锁定可能需要删除的伏笔，利用读取工具进行读取。\n"
         "4. 使用伏笔工具，对已有的伏笔进行增删。"
     )
+    # ★ v3.1修复: 全局默认采样参数（配置面板「功能提示词配置」页保存）
+    temperature: float = 1.0
+    top_p: float = 0.9
+    max_tokens: int = 2048
     outline_expanded_ids: list[str] = field(default_factory=list)  # ★ 大纲展开节点
     # ★ v3修复: UI 状态保存
     last_panel_id: str = ""           # 上次打开的导航面板
@@ -148,6 +152,9 @@ class AppConfig:
             "last_add_enabled": self.last_add_enabled,
             "status_prompt_template": self.status_prompt_template,
             "chat_skill_text": self.chat_skill_text,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_tokens": self.max_tokens,
             "outline_expanded_ids": self.outline_expanded_ids,
             "last_panel_id": self.last_panel_id,
             "last_session_id": self.last_session_id,
@@ -175,6 +182,9 @@ class AppConfig:
             last_add_enabled=d.get("last_add_enabled", False),
             status_prompt_template=d.get("status_prompt_template", AppConfig.status_prompt_template),
             chat_skill_text=d.get("chat_skill_text", AppConfig.chat_skill_text),
+            temperature=d.get("temperature", 1.0),
+            top_p=d.get("top_p", 0.9),
+            max_tokens=d.get("max_tokens", 2048),
             outline_expanded_ids=d.get("outline_expanded_ids", []),
             last_panel_id=d.get("last_panel_id", ""),
             last_session_id=d.get("last_session_id", ""),
@@ -207,8 +217,25 @@ class ConfigManager:
         self._event_bus: EventBus = get_event_bus()
         self._logger: Logger = get_logger()
 
-        # 加密密钥（延迟派生）
+        # 加密密钥（延迟派生，首次派生后缓存，避免每次解密都重新计算）
         self._encryption_key: Optional[bytes] = None
+        self._prewarm_started = False
+
+    def prewarm_key(self) -> None:
+        """预热加密密钥（后台调用）。
+
+        ★ v3性能优化: 密钥派生会触发 wmic 机器标识查询（在部分 Windows
+        上可能耗时数秒），若等到用户第一次打开配置/解密时才执行，会造成
+        明显卡顿。因此应用启动时在后台线程预热，缓存密钥，后续使用即时返回。
+        """
+        if self._prewarm_started:
+            return
+        self._prewarm_started = True
+        try:
+            self._derive_encryption_key()
+            self._logger.log("加密密钥已预热", "ConfigManager", "DEBUG")
+        except Exception as e:
+            self._logger.log(f"密钥预热失败: {e}", "ConfigManager", "WARNING")
 
     # ==================== 应用配置 ====================
 
@@ -440,41 +467,66 @@ class ConfigManager:
         return conn
 
     def _derive_encryption_key(self) -> bytes:
-        """派生 AES-256 加密密钥"""
+        """派生 AES-256 加密密钥（结果缓存，进程内只派生一次）"""
         if self._encryption_key is not None:
             return self._encryption_key
 
-        machine_id = self._get_machine_id()
-        # 使用机器标识作为 PBKDF2 的输入
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,  # AES-256
-            salt=b"novel_assistant_fixed_salt",  # 固定 salt，密钥不跨机器共享
-            iterations=self.PBKDF2_ITERATIONS,
-            backend=default_backend(),
-        )
-        self._encryption_key = kdf.derive(machine_id.encode("utf-8"))
-        return self._encryption_key
+        # 加锁防止预热线程与 UI 线程同时派生（结果一致，仅避免重复计算）
+        with self._lock:
+            if self._encryption_key is not None:
+                return self._encryption_key
+            machine_id = self._get_machine_id()
+            # 使用机器标识作为 PBKDF2 的输入
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,  # AES-256
+                salt=b"novel_assistant_fixed_salt",  # 固定 salt，密钥不跨机器共享
+                iterations=self.PBKDF2_ITERATIONS,
+                backend=default_backend(),
+            )
+            self._encryption_key = kdf.derive(machine_id.encode("utf-8"))
+            return self._encryption_key
 
-    @staticmethod
-    def _get_machine_id() -> str:
-        """获取机器标识（Windows WMI: CPU ID + 主板序列号）
+    # 机器标识缓存（进程内只计算一次；wmic 在部分 Windows 上可能很慢或挂起）
+    _MACHINE_ID_CACHE: Optional[str] = None
+    _MACHINE_ID_LOCK = threading.Lock()
+
+    @classmethod
+    def _get_machine_id(cls) -> str:
+        """获取机器标识（缓存结果，避免每次解密都触发慢速 wmic 子进程）
+
+        ★ v3性能优化:
+          - wmic 已被微软弃用，在较新的 Windows 上可能不存在或挂起，原实现
+            每次派生密钥都会执行 2 个子进程（各最多 5s），导致打开配置界面时
+            明显卡顿。改为结果缓存 + 更短的超时 + 首选环境变量。
+          - 由于加密密钥在本进程内仅派生一次并缓存，此处也只需计算一次。
 
         Returns:
             机器标识字符串，获取失败返回 "novel_assistant_default"
         """
+        if cls._MACHINE_ID_CACHE is not None:
+            return cls._MACHINE_ID_CACHE
+
+        with cls._MACHINE_ID_LOCK:
+            if cls._MACHINE_ID_CACHE is not None:
+                return cls._MACHINE_ID_CACHE
+            cls._MACHINE_ID_CACHE = cls._compute_machine_id()
+            return cls._MACHINE_ID_CACHE
+
+    @staticmethod
+    def _compute_machine_id() -> str:
+        """实际计算机器标识（只在第一次调用时执行）"""
+        # 首选：wmic CPU + 主板序列号（缩短超时，避免长时间阻塞）
         try:
-            # 尝试获取 CPU ID
             cpu_result = subprocess.run(
                 ["wmic", "cpu", "get", "ProcessorId"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=2,
             )
             cpu_id = cpu_result.stdout.strip().split("\n")[-1].strip()
 
-            # 尝试获取主板序列号
             board_result = subprocess.run(
                 ["wmic", "baseboard", "get", "SerialNumber"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=2,
             )
             board_sn = board_result.stdout.strip().split("\n")[-1].strip()
 

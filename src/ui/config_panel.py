@@ -102,7 +102,7 @@ class ConfigPanel(BasePanel):
         f1 = QHBoxLayout(g1)
         self._temp_slider = QSlider(Qt.Orientation.Horizontal)
         self._temp_slider.setRange(0, 200)
-        self._temp_slider.setValue(int(cfg.temperature * 100) if hasattr(cfg, 'temperature') else 100)
+        self._temp_slider.setValue(int(getattr(cfg, 'temperature', 1.0) * 100))
         self._temp_label = QLabel(f"{self._temp_slider.value() / 100:.2f}")
         self._temp_slider.valueChanged.connect(lambda v: self._temp_label.setText(f"{v/100:.2f}"))
         f1.addWidget(self._temp_slider)
@@ -182,6 +182,27 @@ class ConfigPanel(BasePanel):
 
     def on_show(self):
         self._refresh_source_list()
+        self._reload_prompt_values()
+
+    def _reload_prompt_values(self):
+        """从磁盘重新加载功能提示词配置到 UI。
+
+        ★ v3.1修复: 面板只初始化一次，保存后再次进入配置页时
+        UI 仍是旧值，导致看起来"没有保存成功"。这里每次显示时
+        重新加载，确保显示与磁盘一致。
+        """
+        try:
+            cfg = self._config_manager.load_app_config()
+        except Exception:
+            return
+        self._temp_slider.setValue(int(getattr(cfg, 'temperature', 1.0) * 100))
+        self._top_p_slider.setValue(int(getattr(cfg, 'top_p', 0.9) * 100))
+        self._max_tokens_spin.setValue(getattr(cfg, 'max_tokens', 2048))
+        self._skill_text.setPlainText(getattr(cfg, 'chat_skill_text', '') or self._default_skill())
+        self._status_template.setPlainText(
+            getattr(cfg, 'status_prompt_template', '') or
+            "请基于以下项目数据生成创作状态报告。\n项目: {project}\n大纲节点: {node_count}\n数据: {data}"
+        )
 
     # ── Source list ──
 

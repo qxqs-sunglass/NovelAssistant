@@ -645,7 +645,7 @@ class AIClient:
         if not model:
             raise AIClientError("模型名未设置，请在配置中填写模型名称", "not_configured")
 
-        full_text = ""
+        final_answer = ""  # ★ 只记录最终纯文本回复；工具调用轮次的文本不进入最终答案
         full_reasoning = ""  # ★ v2.2.2 深度思考内容（跨轮次累积）
         for _round in range(max_rounds):
             # 每轮都发送 tool definitions。
@@ -681,14 +681,10 @@ class AIClient:
                             "AIClient",
                         )
 
-                    # 文本块
+                    # 文本块 —— ★ 只缓冲不实时流式；等整轮确认是纯文本回复后再统一展示，
+                    # 避免工具调用轮次的中间文本被当作独立消息显示（产生"两次消息"问题）
                     if delta.content:
                         round_text += delta.content
-                        full_text += delta.content
-                        self._event_bus.publish(
-                            "ai:response_chunk", {"text": delta.content}, "AIClient"
-                        )
-                        yield {"type": "chunk", "content": delta.content}
 
                     # 工具调用块
                     if delta.tool_calls:
@@ -765,14 +761,29 @@ class AIClient:
                             "patterns_found": len(hallucinated),
                         }
 
-                        # 将 assistant 原始消息追加到历史
+                        # ★ v5修复: 为每个幻觉工具调用生成正式的 tool_calls 记录，
+                        # 使 assistant 消息携带 tool_calls 字段、tool 消息的 tool_call_id
+                        # 能够正确对应，避免"孤儿 tool 消息"导致后续 API 请求 400。
+                        hallucinated_tool_calls = [
+                            {
+                                "id": f"hall_{i}",
+                                "type": "function",
+                                "function": {
+                                    "name": hc["name"],
+                                    "arguments": json.dumps(hc["arguments"], ensure_ascii=False),
+                                },
+                            }
+                            for i, hc in enumerate(hallucinated)
+                        ]
+                        # 将 assistant 原始消息追加到历史（带 tool_calls）
                         full_messages.append({
                             "role": "assistant",
                             "content": round_text,
+                            "tool_calls": hallucinated_tool_calls,
                         })
 
                         # 逐个执行
-                        for hc in hallucinated:
+                        for tc_hall, hc in zip(hallucinated_tool_calls, hallucinated):
                             tool_name = hc["name"]
                             arguments = hc["arguments"]
 
@@ -812,10 +823,10 @@ class AIClient:
                                 "hallucinated": True,
                             }
 
-                            # 追加工具结果到消息历史（用 hall_ 前缀区分）
+                            # 追加工具结果到消息历史（tool_call_id 与 assistant 的 tool_calls 对应）
                             full_messages.append({
                                 "role": "tool",
-                                "tool_call_id": f"hall_{tool_name}",
+                                "tool_call_id": tc_hall["id"],
                                 "content": str(result),
                             })
 
@@ -832,7 +843,13 @@ class AIClient:
 
                         continue  # 继续下一轮
 
-                # 纯文本回复，完成
+                # 纯文本回复，完成 —— 只此一条助手消息，统一作为最终答案展示
+                final_answer = round_text
+                if final_answer:
+                    self._event_bus.publish(
+                        "ai:response_chunk", {"text": final_answer}, "AIClient"
+                    )
+                    yield {"type": "chunk", "content": final_answer}
                 if full_reasoning:
                     self._event_bus.publish(
                         "ai:reasoning_end",
@@ -841,10 +858,10 @@ class AIClient:
                     )
                 self._event_bus.publish(
                     "ai:response_end",
-                    {"full_text": full_text, "model": self._model, "reasoning": full_reasoning},
+                    {"full_text": final_answer, "model": self._model, "reasoning": full_reasoning},
                     "AIClient",
                 )
-                yield {"type": "done", "full_text": full_text}
+                yield {"type": "done", "full_text": final_answer}
                 return
 
             except APIConnectionError as e:
@@ -858,8 +875,20 @@ class AIClient:
                 raise AIClientError(f"工具调用请求失败: {e}", "api")
 
         # 超过最大轮数
+        # ★ v5修复: 补发 ai:response_end，避免 UI 停在中途、没有结束信号
+        if full_reasoning:
+            self._event_bus.publish(
+                "ai:reasoning_end",
+                {"full_reasoning": full_reasoning},
+                "AIClient",
+            )
+        self._event_bus.publish(
+            "ai:response_end",
+            {"full_text": final_answer, "model": self._model, "reasoning": full_reasoning},
+            "AIClient",
+        )
         self._event_bus.publish("ai:response_error", {"error": f"工具调用超过最大轮数 ({max_rounds})"}, "AIClient")
-        yield {"type": "error", "error": f"工具调用超过最大轮数 ({max_rounds})"}
+        yield {"type": "error", "error": f"工具调用超过最大轮数 ({max_rounds})", "full_text": final_answer}
 
     # ==================== 状态查询 ====================
 

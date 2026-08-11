@@ -4,12 +4,13 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QTreeWidget, QTreeWidgetItem, QListWidget, QListWidgetItem,
     QLineEdit, QTextEdit, QPushButton, QLabel, QComboBox, QMenu, QHeaderView, QMessageBox,
+    QGridLayout,
 )
 from PySide6.QtCore import Qt
 
 from src.ui.base_panel import BasePanel
 from src.ui.common import mb_info, mb_warn, mb_error, mb_ask, dialog_toplevel
-from src.services.project_service import NodeStatus
+from src.services.project_service import NodeStatus, OutlineLevel
 
 
 class OutlinePanel(BasePanel):
@@ -50,6 +51,21 @@ class OutlinePanel(BasePanel):
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
+        # ★ v3补齐: 树工具栏（搜索 + 展开/收起）
+        tree_toolbar = QHBoxLayout()
+        self._search_box = QLineEdit()
+        self._search_box.setPlaceholderText("🔍 搜索节点")
+        self._search_box.textChanged.connect(self._filter_tree)
+        tree_toolbar.addWidget(self._search_box)
+        btn_expand = QPushButton("📂")
+        btn_expand.setFixedWidth(32)
+        btn_expand.clicked.connect(self._expand_all)
+        btn_collapse = QPushButton("📁")
+        btn_collapse.setFixedWidth(32)
+        btn_collapse.clicked.connect(self._collapse_all)
+        tree_toolbar.addWidget(btn_expand)
+        tree_toolbar.addWidget(btn_collapse)
+        ll.addLayout(tree_toolbar)
         self._tree = QTreeWidget()
         self._tree.setHeaderLabel("大纲树")
         self._tree.setColumnCount(1)
@@ -59,6 +75,20 @@ class OutlinePanel(BasePanel):
         self._tree.itemExpanded.connect(self._on_tree_expanded)
         self._tree.itemCollapsed.connect(self._on_tree_collapsed)
         ll.addWidget(self._tree)
+        # ★ v3补齐: 大纲统计面板
+        self._stats_widget = QWidget()
+        self._stats_widget.setVisible(True)
+        stats_l = QVBoxLayout(self._stats_widget)
+        stats_l.setContentsMargins(4, 4, 4, 4)
+        self._stats_toggle_btn = QPushButton("📊 大纲统计 ▼")
+        self._stats_toggle_btn.setStyleSheet("text-align:left; background:#e8e8e8; border:none; padding:2px 4px;")
+        self._stats_toggle_btn.clicked.connect(self._toggle_stats)
+        stats_l.addWidget(self._stats_toggle_btn)
+        self._stats_body = QLabel("")
+        self._stats_body.setWordWrap(True)
+        self._stats_body.setStyleSheet("color:#555; font-size:11px; padding:2px 4px;")
+        stats_l.addWidget(self._stats_body)
+        ll.addWidget(self._stats_widget)
         splitter.addWidget(left)
 
         # Middle: child list + buttons
@@ -67,18 +97,18 @@ class OutlinePanel(BasePanel):
         ml.setContentsMargins(4, 4, 4, 4)
         ml.addWidget(QLabel("子节点"))
         self._child_list = QListWidget()
-        ml.addWidget(self._child_list)
-        # Buttons
-        btn_grid = QVBoxLayout()
-        for text, slot in [
+        ml.addWidget(self._child_list, 1)
+        # Buttons — ★ v3修复: 改为两列网格布局，节省纵向空间，给子节点列表留更多空间
+        btn_grid = QGridLayout()
+        for i, (text, slot) in enumerate([
             ("▲ 上移", self._move_child_up), ("▼ 下移", self._move_child_down),
             ("✏ 重命名", self._rename_selected), ("+ 新建", self._create_child),
             ("⬆ 升级", self._promote_node), ("⬇ 降级", self._demote_node),
             ("合并", self._merge_nodes), ("🗑 删除", self._delete_node),
-        ]:
+        ]):
             btn = QPushButton(text)
             btn.clicked.connect(slot)
-            btn_grid.addWidget(btn)
+            btn_grid.addWidget(btn, i // 2, i % 2)
         ml.addLayout(btn_grid)
         splitter.addWidget(mid)
 
@@ -114,7 +144,8 @@ class OutlinePanel(BasePanel):
         rl.addWidget(save_btn)
         splitter.addWidget(right)
 
-        splitter.setSizes([220, 180, 400])
+        # ★ v3修复: 调小中栏、调大右侧编辑器，让右侧编辑区更宽敞
+        splitter.setSizes([220, 120, 480])
         layout.addWidget(splitter, 1)
 
     def _subscribe_events(self):
@@ -272,6 +303,10 @@ class OutlinePanel(BasePanel):
         menu = QMenu(self)
         menu.addAction("更改父节点", lambda: self._change_parent())
         menu.addAction("✏ 重命名", self._rename_selected)
+        # ★ v3补齐: 右键状态切换
+        status_menu = menu.addMenu("更改状态")
+        for text, status in self.STATUS_MAP.items():
+            status_menu.addAction(text, lambda s=status: self._set_node_status(s))
         menu.addSeparator()
         menu.addAction("+ 新建子节点", self._create_child)
         menu.addAction("合并子节点", self._merge_nodes)
@@ -315,7 +350,12 @@ class OutlinePanel(BasePanel):
 
     def _do_create_child(self, title, dlg):
         if title and self._current_node_id:
-            self._project_service.create_node(self._current_node_id, title)
+            parent = self._project_service.get_node(self._current_node_id)
+            if not parent:
+                return
+            # 子节点层级 = 父节点层级 + 1，最高封顶到正文 (L5)
+            child_level = OutlineLevel(min(parent.level.value + 1, 5))
+            self._project_service.create_node(self._current_node_id, title, child_level)
             self._refresh_tree()
             self._update_stats()
             dlg.accept()
@@ -491,3 +531,99 @@ class OutlinePanel(BasePanel):
         nodes = self._project_service.get_outline_tree()
         if nodes:
             self._stats_label.setText(f"大纲节点: {len(nodes)}")
+        # ★ v3补齐: 刷新统计面板
+        self._refresh_stats_panel()
+
+    def _refresh_stats_panel(self):
+        """刷新左栏大纲统计面板"""
+        try:
+            nodes = self._project_service.get_outline_tree()
+            if not nodes:
+                self._stats_body.setText("  无数据")
+                return
+            total = len(nodes)
+            level_counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+            done = 0
+            for n in nodes:
+                level_counts[n.level.value] = level_counts.get(n.level.value, 0) + 1
+                if n.status == NodeStatus.COMPLETED:
+                    done += 1
+            pct = f"{done / total * 100:.0f}%" if total > 0 else "0%"
+            lines = [
+                f"总节点: {total}    完成率: {pct}",
+                f"L1:{level_counts[1]} L2:{level_counts[2]} L3:{level_counts[3]} "
+                f"L4:{level_counts[4]} L5:{level_counts[5]}",
+            ]
+            self._stats_body.setText("\n".join(lines))
+        except Exception:
+            self._stats_body.setText("")
+
+    # ── ★ v3补齐: 展开/收起/搜索过滤 ──
+
+    def _expand_all(self):
+        """展开大纲树全部节点"""
+        for i in range(self._tree.topLevelItemCount()):
+            self._expand_item(self._tree.topLevelItem(i))
+        self._tree.expandAll()
+
+    def _expand_item(self, item: QTreeWidgetItem):
+        nid = item.data(0, Qt.ItemDataRole.UserRole)
+        if nid:
+            self._expanded_ids.add(nid)
+        for i in range(item.childCount()):
+            self._expand_item(item.child(i))
+
+    def _collapse_all(self):
+        """折叠大纲树全部节点"""
+        self._tree.collapseAll()
+        self._expanded_ids.clear()
+
+    def _filter_tree(self):
+        """搜索过滤：匹配节点并展开路径"""
+        keyword = self._search_box.text().strip().lower()
+        if not keyword:
+            # 恢复默认样式
+            for i in range(self._tree.topLevelItemCount()):
+                self._restore_item_style(self._tree.topLevelItem(i))
+            return
+        for i in range(self._tree.topLevelItemCount()):
+            self._walk_and_highlight(self._tree.topLevelItem(i), keyword)
+
+    def _restore_item_style(self, item: QTreeWidgetItem):
+        item.setBackground(0, Qt.GlobalColor.transparent)
+        for i in range(item.childCount()):
+            self._restore_item_style(item.child(i))
+
+    def _walk_and_highlight(self, item: QTreeWidgetItem, keyword: str) -> bool:
+        hit = keyword in item.text(0).lower()
+        child_hit = False
+        for i in range(item.childCount()):
+            if self._walk_and_highlight(item.child(i), keyword):
+                child_hit = True
+        if hit:
+            item.setBackground(0, Qt.GlobalColor.yellow)
+            item.setForeground(0, Qt.GlobalColor.black)
+        if hit or child_hit:
+            item.setExpanded(True)
+        return hit or child_hit
+
+    def _toggle_stats(self):
+        """展开/折叠统计面板"""
+        if self._stats_body.isVisible():
+            self._stats_body.hide()
+            self._stats_toggle_btn.setText("📊 大纲统计 ▶")
+        else:
+            self._stats_body.show()
+            self._stats_toggle_btn.setText("📊 大纲统计 ▼")
+            self._refresh_stats_panel()
+
+    # ── ★ v3补齐: 右键状态切换 ──
+
+    def _set_node_status(self, status: NodeStatus):
+        if not self._current_node_id:
+            return
+        node = self._project_service.get_node(self._current_node_id)
+        if node and node.status != status:
+            self._project_service.update_node(self._current_node_id, status=status)
+            self._refresh_tree()
+            self._update_stats()

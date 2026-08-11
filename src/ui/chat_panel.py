@@ -156,6 +156,15 @@ class ChatPanel(BasePanel):
 
     chunk_received = Signal(str)
     response_ended = Signal(dict)
+    # ★ v3修复: 深度思考事件跨线程桥接（AI 线程 emit → 主线程槽执行）
+    reasoning_chunk_sig = Signal(str)
+    reasoning_end_sig = Signal()
+    # ★ v4修复: 错误/工具调用/工具结果事件同样需要跨线程桥接
+    response_error_sig = Signal(dict)
+    tool_call_sig = Signal(dict)
+    tool_result_sig = Signal(dict)
+    # ★ v4修复: 流式结束后的 UI 复位（避免在 AI 线程直接操作控件）
+    stream_finished = Signal()
 
     def __init__(self, event_bus, logger,
                  ai_client: AIClient, session_manager: SessionManager,
@@ -190,6 +199,12 @@ class ChatPanel(BasePanel):
         # Connect thread-safe signals
         self.chunk_received.connect(self._do_insert_chunk)
         self.response_ended.connect(self._do_response_end)
+        self.reasoning_chunk_sig.connect(self._do_reasoning_chunk)
+        self.reasoning_end_sig.connect(self._do_reasoning_end)
+        self.response_error_sig.connect(self._do_response_error)
+        self.tool_call_sig.connect(self._do_tool_call)
+        self.tool_result_sig.connect(self._do_tool_result)
+        self.stream_finished.connect(self._do_stream_finished)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -213,7 +228,7 @@ class ChatPanel(BasePanel):
         tb.addWidget(new_sess)
         tb.addWidget(del_sess)
         self._tool_check = QCheckBox("🔧 工具")
-        self._tool_check.setChecked(False)
+        self._tool_check.setChecked(True)
         tb.addWidget(self._tool_check)
         layout.addLayout(tb)
 
@@ -278,11 +293,18 @@ class ChatPanel(BasePanel):
         self._input_text = QTextEdit()
         self._input_text.setMaximumHeight(80)
         self._input_text.setPlaceholderText("输入消息... (Ctrl+Enter 发送)")
+        # ★ v3补齐: 实时 token 估算
+        self._input_text.textChanged.connect(self._update_token_estimate)
         # Use QShortcut instead of eventFilter on non-QObject
         from PySide6.QtGui import QShortcut, QKeySequence
         sc = QShortcut(QKeySequence("Ctrl+Return"), self._input_text)
         sc.activated.connect(self._on_send)
         il.addWidget(self._input_text)
+        self._token_label = QLabel("")
+        self._token_label.setStyleSheet("color:#999; font-size:10px;")
+        self._token_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._token_label.setFixedWidth(60)
+        il.addWidget(self._token_label)
         self._send_btn = QPushButton("发送")
         self._send_btn.clicked.connect(self._on_send)
         self._send_btn.setStyleSheet("background:#0078d4; color:white; padding:8px 16px; font-weight:bold;")
@@ -397,9 +419,10 @@ class ChatPanel(BasePanel):
                 s = self._session_manager.get_session(session_id)
                 msgs = list(s.messages) if s else []
                 self._session_history = msgs
-                QTimer.singleShot(0, lambda: self._render_history(msgs, 0))
+                # ★ v3修复: 指定 receiver=self，回调在面板所在线程（主线程）执行
+                QTimer.singleShot(0, self, lambda: self._render_history(msgs, 0))
             except Exception:
-                QTimer.singleShot(0, lambda: self._add_system_bubble("加载失败"))
+                QTimer.singleShot(0, self, lambda: self._add_system_bubble("加载失败"))
 
         threading.Thread(target=load, daemon=True).start()
 
@@ -410,7 +433,8 @@ class ChatPanel(BasePanel):
         for m in batch:
             self._append_message(m.get("role", "system"), m.get("content", ""), m)
         if index + 10 < len(msgs):
-            QTimer.singleShot(10, lambda: self._render_history(msgs, index + 10))
+            # ★ v3修复: 指定 receiver=self，分批调度回到主线程
+            QTimer.singleShot(10, self, lambda: self._render_history(msgs, index + 10))
 
     def _new_session(self):
         s = self._session_manager.create_session()
@@ -583,7 +607,29 @@ class ChatPanel(BasePanel):
             try:
                 if use_tools:
                     for chunk in self._ai_client.chat_with_tools(messages, self._tool_registry, system_prompt, max_rounds):
-                        pass
+                        # ★ v5修复: 真正消费生成器产出的事件，避免 error 等事件被丢弃
+                        if not isinstance(chunk, dict):
+                            continue
+                        ctype = chunk.get("type")
+                        if ctype == "tool_call":
+                            self._event_bus.publish(
+                                "ai:tool_call",
+                                {"tool": chunk.get("tool", "?"), "args": chunk.get("args", {}),
+                                 "hallucinated": bool(chunk.get("hallucinated", False))},
+                                "ChatPanel",
+                            )
+                        elif ctype == "tool_result":
+                            self._event_bus.publish(
+                                "ai:tool_result",
+                                {"tool": chunk.get("tool", "?"), "result": chunk.get("result", "")},
+                                "ChatPanel",
+                            )
+                        elif ctype == "error":
+                            # AIClient 内部在 yield error 前已发布 ai:response_end（超过最大轮数时），
+                            # 这里不再重复补发，否则会触发两次 _do_response_end、
+                            # 导致重复写入两条助手消息（"两次消息"问题）。
+                            pass
+                        # chunk/ hallucination_detected 事件已在 AIClient 内部发布，无需重复处理
                 else:
                     for chunk in self._ai_client.chat_stream(messages, system_prompt):
                         pass
@@ -593,9 +639,8 @@ class ChatPanel(BasePanel):
                 self._event_bus.publish("ai:response_error", {"error": str(e)}, "ChatPanel")
             finally:
                 self._is_streaming = False
-                QTimer.singleShot(0, lambda: self._send_btn.setText("发送"))
-                QTimer.singleShot(0, lambda: self._send_btn.setStyleSheet(
-                    "background:#0078d4; color:white; padding:8px 16px; font-weight:bold;"))
+                # ★ v4修复: 通过信号回主线程复位按钮，避免在 AI 线程直接操作控件
+                self.stream_finished.emit()
 
         threading.Thread(target=stream_thread, daemon=True).start()
 
@@ -613,6 +658,19 @@ class ChatPanel(BasePanel):
         if len(messages) <= keep * 2:
             return messages
         return messages[-(keep * 2):]
+
+    # ★ v3补齐: token 估算
+    def _estimate_tokens(self, text: str) -> int:
+        """粗略估算 token 数（中文≈1字1token，其他字符≈3字1token）"""
+        chinese = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        other = len(text) - chinese
+        return chinese + int(other / 3)
+
+    def _update_token_estimate(self):
+        """实时更新输入框 token 估算"""
+        text = self._input_text.toPlainText()
+        n = self._estimate_tokens(text)
+        self._token_label.setText(f"~{n}tk" if n > 0 else "")
 
     # ── ★ v3移植: 内容勾选面板 ──
 
@@ -651,7 +709,7 @@ class ChatPanel(BasePanel):
                 key = f"setting:{cat}/{doc}"
                 checked = saved_state.get(key, False)
                 self._content_selected[key] = checked
-                doc_item = QTreeWidgetItem([("☑ " if checked else "☐ ") + doc])
+                doc_item = QTreeWidgetItem([f"📄 {doc}"])
                 doc_item.setData(0, Qt.ItemDataRole.UserRole, key)
                 doc_item.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
                 cat_item.addChild(doc_item)
@@ -665,7 +723,7 @@ class ChatPanel(BasePanel):
         key = f"outline:{node.node_id}"
         checked = (saved_state or {}).get(key, False)
         self._content_selected[key] = checked
-        item = QTreeWidgetItem([("☑ " if checked else "☐ ") + f"{icon} {node.title}"])
+        item = QTreeWidgetItem([f"{icon} {node.title}"])
         item.setData(0, Qt.ItemDataRole.UserRole, key)
         item.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
         if parent_item is None:
@@ -692,14 +750,8 @@ class ChatPanel(BasePanel):
         self._update_content_count()
 
     def _sync_item_prefix(self, item: QTreeWidgetItem, key: str):
-        """按勾选状态刷新节点 ☑/☐ 前缀"""
-        checked = self._content_selected.get(key, False)
-        text = item.text(0)
-        for prefix in ("☑ ", "☐ "):
-            if text.startswith(prefix):
-                text = text[len(prefix):]
-                break
-        item.setText(0, ("☑ " if checked else "☐ ") + text)
+        """勾选状态由原生复选框显示，无需额外前缀"""
+        return
 
     def _update_content_count(self):
         count = sum(1 for v in self._content_selected.values() if v)
@@ -957,28 +1009,52 @@ class ChatPanel(BasePanel):
                                               meta=meta if meta else None)
 
     def _on_response_error_evt(self, event):
-        self._add_system_bubble(f"❌ 错误: {event.data.get('error', '未知')}")
+        # ★ v4修复: 仅转发信号（AI 线程），UI 操作在 _do_response_error（主线程）
+        self.response_error_sig.emit(event.data)
 
     def _on_tool_call_evt(self, event):
-        tool = event.data.get("tool", "?")
-        args = event.data.get("args", {})
-        self._pending_tool_calls.append({"tool": tool, "args": args,
-                                         "hallucinated": bool(event.data.get("hallucinated", False))})
-        self._add_collapsible("🔧", f"调用工具: {tool}", json.dumps(args, ensure_ascii=False))
+        # ★ v4修复: 仅转发信号（AI 线程），UI 操作在 _do_tool_call（主线程）
+        self.tool_call_sig.emit(event.data)
 
     def _on_tool_result_evt(self, event):
-        tool = event.data.get("tool", "?")
-        result = event.data.get("result", "")
+        # ★ v4修复: 仅转发信号（AI 线程），UI 操作在 _do_tool_result（主线程）
+        self.tool_result_sig.emit(event.data)
+
+    def _do_response_error(self, data: dict):
+        self._add_system_bubble(f"❌ 错误: {data.get('error', '未知')}")
+
+    def _do_tool_call(self, data: dict):
+        tool = data.get("tool", "?")
+        args = data.get("args", {})
+        self._pending_tool_calls.append({"tool": tool, "args": args,
+                                         "hallucinated": bool(data.get("hallucinated", False))})
+        self._add_collapsible("🔧", f"调用工具: {tool}", json.dumps(args, ensure_ascii=False))
+
+    def _do_tool_result(self, data: dict):
+        tool = data.get("tool", "?")
+        result = data.get("result", "")
         self._add_collapsible("✅", f"工具结果: {tool}", str(result)[:2000])
 
+    def _do_stream_finished(self):
+        self._send_btn.setText("发送")
+        self._send_btn.setStyleSheet(
+            "background:#0078d4; color:white; padding:8px 16px; font-weight:bold;")
+
     def _on_reasoning_chunk(self, event):
-        text = event.data.get("text", "")
+        # ★ v3修复: 仅转发信号（AI 线程），UI 操作在 _do_reasoning_chunk（主线程）
+        self.reasoning_chunk_sig.emit(event.data.get("text", ""))
+
+    def _do_reasoning_chunk(self, text: str):
         self._current_reasoning += text
         if self._reasoning_window is None or not self._reasoning_window.is_alive():
             self._reasoning_window = ReasoningWindow(self)
         self._reasoning_window.append(text)
 
     def _on_reasoning_end(self, event):
+        # ★ v3修复: 仅转发信号（AI 线程），UI 操作在 _do_reasoning_end（主线程）
+        self.reasoning_end_sig.emit()
+
+    def _do_reasoning_end(self):
         if self._reasoning_window and self._reasoning_window.is_alive():
             self._reasoning_window.finish()
 
