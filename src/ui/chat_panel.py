@@ -5,14 +5,13 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QFrame,
     QLabel, QTextEdit, QPushButton, QTextBrowser,
     QComboBox, QCheckBox, QTreeWidget, QTreeWidgetItem,
-    QSplitter, QSizePolicy,
+    QSplitter, QSizePolicy, QApplication, QMenu,
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont
 
 from src.ui.base_panel import BasePanel
 from src.ui.common import (
-    mb_info, mb_warn, mb_error, mb_ask,
     dialog_toplevel, ReasoningWindow, DetailPopup,
 )
 from src.services.ai_client import AIClient, ChatMessage, AIClientError
@@ -180,6 +179,11 @@ class ChatPanel(BasePanel):
         self._sys_prompt = ""
         self._add_prompt = ""
         self._add_enabled = False
+        # ★ v3修复: 内容勾选状态 {key: checked}
+        self._content_selected: dict[str, bool] = {}
+        self._content_panel_visible = False
+        # ★ v3修复: 内容树重建/批量更新时的信号屏蔽标志
+        self._content_updating = False
 
         super().__init__(event_bus, logger)
 
@@ -221,7 +225,37 @@ class ChatPanel(BasePanel):
         prompt_btn.clicked.connect(self._toggle_prompts)
         prompt_header.addWidget(prompt_btn)
         prompt_header.addWidget(self._prompt_summary, 1)
+        # ★ v3修复: 内容勾选按钮
+        self._content_summary_btn = QPushButton("📎 勾选")
+        self._content_summary_btn.clicked.connect(self._toggle_content_panel)
+        prompt_header.addWidget(self._content_summary_btn)
         layout.addLayout(prompt_header)
+
+        # ★ v3修复: 内容勾选面板（默认隐藏）
+        self._content_panel = QWidget()
+        cp_layout = QVBoxLayout(self._content_panel)
+        cp_layout.setContentsMargins(4, 0, 4, 0)
+        cp_header = QHBoxLayout()
+        self._content_count_label = QLabel("已选: 0")
+        self._content_count_label.setStyleSheet("color: #666; font-size: 11px;")
+        sel_all = QPushButton("全选")
+        sel_all.setFixedWidth(52)
+        sel_all.clicked.connect(self._select_all_content)
+        desel_all = QPushButton("全不选")
+        desel_all.setFixedWidth(52)
+        desel_all.clicked.connect(self._deselect_all_content)
+        cp_header.addWidget(self._content_count_label)
+        cp_header.addStretch(1)
+        cp_header.addWidget(sel_all)
+        cp_header.addWidget(desel_all)
+        cp_layout.addLayout(cp_header)
+        self._content_tree = QTreeWidget()
+        self._content_tree.setHeaderHidden(True)
+        self._content_tree.setMaximumHeight(180)
+        self._content_tree.itemChanged.connect(self._on_content_item_changed)
+        cp_layout.addWidget(self._content_tree)
+        self._content_panel.hide()
+        layout.addWidget(self._content_panel)
 
         # ── Messages area ──
         self._scroll_area = QScrollArea()
@@ -233,6 +267,9 @@ class ChatPanel(BasePanel):
         self._scroll_layout.addStretch()
         self._scroll_area.setWidget(self._scroll_inner)
         layout.addWidget(self._scroll_area, 1)
+        # ★ v3修复: 消息区右键菜单（复制全文/重试）
+        self._scroll_area.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._scroll_area.customContextMenuRequested.connect(self._show_msg_menu)
 
         # ── Input area ──
         input_frame = QWidget()
@@ -268,6 +305,8 @@ class ChatPanel(BasePanel):
         self._restore_last_session()
         self._refresh_session_list()
         self._refresh_chat_projects()
+        # ★ v3移植: 刷新内容勾选树
+        self._refresh_content_tree()
 
     def on_close(self):
         # ★ v3修复: 保存提示词状态 + 当前会话
@@ -468,8 +507,12 @@ class ChatPanel(BasePanel):
     # ── Sending ──
 
     def _on_send(self):
+        # ★ v3移植: 流式输出中点击发送按钮 = 停止
+        if self._is_streaming:
+            self._stop_streaming()
+            return
         text = self._input_text.toPlainText().strip()
-        if not text or self._is_streaming:
+        if not text:
             return
         self._input_text.clear()
 
@@ -478,8 +521,12 @@ class ChatPanel(BasePanel):
             self._current_session_id = s.session_id
             self._refresh_session_list()
 
+        # ★ v3移植: 勾选内容引用（仅存摘要，发送时实时读取内容）
+        refs_display = self._get_selected_display()
         self._append_message("user", text)
-        self._session_manager.add_message(self._current_session_id, "user", text)
+        user_meta = {"refs_display": refs_display} if refs_display else None
+        self._session_manager.add_message(self._current_session_id, "user", text,
+                                          meta=user_meta)
 
         # Build system prompt: Skill + 用户系统提示词 + 附加提示词
         skill = self._get_skill_text()
@@ -489,12 +536,34 @@ class ChatPanel(BasePanel):
         if self._add_enabled and self._add_prompt.strip():
             system_prompt += "\n\n" + self._add_prompt.strip()
 
+        # ★ v3移植: 用户消息 = 文本 + 项目上下文数据（大纲树/角色集/设定集/伏笔/勾选内容）
+        selected = self._gather_selected_content()
+        context_parts = []
+        outline_ctx = self._get_outline_tree_context()
+        if outline_ctx:
+            context_parts.append(f"【大纲树】\n{outline_ctx}")
+        char_ctx = self._get_character_summary_context()
+        if char_ctx:
+            context_parts.append(f"【角色集】\n{char_ctx}")
+        settings_ctx = self._get_settings_summary_context()
+        if settings_ctx:
+            context_parts.append(f"【设定集】\n{settings_ctx}")
+        foreshadow_ctx = self._get_foreshadow_context()
+        if foreshadow_ctx:
+            context_parts.append(foreshadow_ctx)
+        if selected:
+            context_parts.append(f"【勾选内容】\n{selected}")
+
+        full_text = text
+        if context_parts:
+            full_text += "\n\n---\n" + "\n\n---\n".join(context_parts)
+
         # History messages
         history = self._session_manager.get_message_history(self._current_session_id, 50)
         history = [m for m in history if m.get("role") not in ("tool",)][:-1]
         messages = [ChatMessage(m["role"], m["content"]) for m in history]
         messages = self._trim_history(messages)
-        messages.append(ChatMessage("user", text))
+        messages.append(ChatMessage("user", full_text))
 
         self._response_buffer = ""
         self._is_streaming = True
@@ -544,6 +613,313 @@ class ChatPanel(BasePanel):
         if len(messages) <= keep * 2:
             return messages
         return messages[-(keep * 2):]
+
+    # ── ★ v3移植: 内容勾选面板 ──
+
+    def _toggle_content_panel(self):
+        """显示/隐藏内容勾选面板"""
+        if self._content_panel_visible:
+            self._content_panel.hide()
+        else:
+            self._content_panel.show()
+            self._refresh_content_tree(keep_state=True)
+        self._content_panel_visible = not self._content_panel_visible
+
+    def _refresh_content_tree(self, keep_state: bool = False):
+        """重建内容勾选树（大纲节点 + 设定文档）"""
+        saved_state = dict(self._content_selected) if keep_state else {}
+        self._content_tree.blockSignals(True)
+        self._content_tree.clear()
+        self._content_selected.clear()
+
+        if not self._project_service.get_current_project():
+            self._content_tree.blockSignals(False)
+            self._update_content_count()
+            return
+
+        # 大纲节点（树形）
+        nodes = self._project_service.get_outline_tree()
+        roots = [n for n in nodes if n.parent_id is None]
+        for root in sorted(roots, key=lambda n: n.order):
+            self._insert_content_node(None, root, nodes, "📗", saved_state)
+
+        # 设定分类
+        for cat in self._project_service.list_categories():
+            cat_item = QTreeWidgetItem([f"📁 {cat}"])
+            self._content_tree.addTopLevelItem(cat_item)
+            for doc in self._project_service.list_docs(cat):
+                key = f"setting:{cat}/{doc}"
+                checked = saved_state.get(key, False)
+                self._content_selected[key] = checked
+                doc_item = QTreeWidgetItem([("☑ " if checked else "☐ ") + doc])
+                doc_item.setData(0, Qt.ItemDataRole.UserRole, key)
+                doc_item.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+                cat_item.addChild(doc_item)
+
+        self._content_tree.blockSignals(False)
+        self._update_content_count()
+
+    def _insert_content_node(self, parent_item, node, all_nodes, icon: str,
+                             saved_state: dict | None = None):
+        """递归插入大纲节点到勾选树"""
+        key = f"outline:{node.node_id}"
+        checked = (saved_state or {}).get(key, False)
+        self._content_selected[key] = checked
+        item = QTreeWidgetItem([("☑ " if checked else "☐ ") + f"{icon} {node.title}"])
+        item.setData(0, Qt.ItemDataRole.UserRole, key)
+        item.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        if parent_item is None:
+            self._content_tree.addTopLevelItem(item)
+        else:
+            parent_item.addChild(item)
+        for cid in node.children_ids:
+            child = next((n for n in all_nodes if n.node_id == cid), None)
+            if child:
+                self._insert_content_node(item, child, all_nodes, "📄", saved_state)
+
+    def _on_content_item_changed(self, item: QTreeWidgetItem, column: int):
+        """勾选状态变更 → 同步 dict + 显示前缀"""
+        key = item.data(0, Qt.ItemDataRole.UserRole)
+        if not key or self._content_updating:
+            return
+        checked = item.checkState(0) == Qt.CheckState.Checked
+        self._content_selected[key] = checked
+        self._content_updating = True
+        try:
+            self._sync_item_prefix(item, key)
+        finally:
+            self._content_updating = False
+        self._update_content_count()
+
+    def _sync_item_prefix(self, item: QTreeWidgetItem, key: str):
+        """按勾选状态刷新节点 ☑/☐ 前缀"""
+        checked = self._content_selected.get(key, False)
+        text = item.text(0)
+        for prefix in ("☑ ", "☐ "):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+                break
+        item.setText(0, ("☑ " if checked else "☐ ") + text)
+
+    def _update_content_count(self):
+        count = sum(1 for v in self._content_selected.values() if v)
+        self._content_count_label.setText(f"已选: {count}")
+        # 更新勾选按钮摘要文本
+        if count == 0:
+            self._content_summary_btn.setText("📎 勾选")
+        else:
+            names = []
+            for key, checked in self._content_selected.items():
+                if not checked:
+                    continue
+                if key.startswith("outline:"):
+                    names.append("大纲·" + key.split(":", 1)[1][:8])
+                elif key.startswith("setting:"):
+                    names.append("设定·" + key.split(":", 1)[1].split("/")[-1][:12])
+            summary = ", ".join(names[:3])
+            if len(names) > 3:
+                summary += f" 等{len(names)}项"
+            self._content_summary_btn.setText(f"📎 {summary}")
+
+    def _select_all_content(self):
+        self._walk_set_all_checkstate(Qt.CheckState.Checked)
+
+    def _deselect_all_content(self):
+        self._walk_set_all_checkstate(Qt.CheckState.Unchecked)
+
+    def _walk_set_all_checkstate(self, state: Qt.CheckState):
+        """批量设置所有勾选项（信号屏蔽 + 直接同步 dict）"""
+        self._content_updating = True
+        try:
+            def walk(item: QTreeWidgetItem):
+                key = item.data(0, Qt.ItemDataRole.UserRole)
+                if key:
+                    self._content_selected[key] = (state == Qt.CheckState.Checked)
+                    item.setCheckState(0, state)
+                    self._sync_item_prefix(item, key)
+                for i in range(item.childCount()):
+                    walk(item.child(i))
+            for i in range(self._content_tree.topLevelItemCount()):
+                walk(self._content_tree.topLevelItem(i))
+        finally:
+            self._content_updating = False
+        self._update_content_count()
+
+    def _gather_selected_content(self) -> str:
+        """收集所有勾选的内容，拼接为一段上下文（发送时实时读取）"""
+        parts = []
+        for key, checked in self._content_selected.items():
+            if not checked:
+                continue
+            if key.startswith("outline:"):
+                node_id = key.replace("outline:", "")
+                node = self._project_service.get_node(node_id)
+                if node and node.content:
+                    parts.append(f"【{node.title}】\n{node.content}")
+            elif key.startswith("setting:"):
+                cat_doc = key.replace("setting:", "")
+                cat, doc = cat_doc.split("/", 1)
+                text = self._project_service.get_setting(cat, doc)
+                if text:
+                    parts.append(f"【设定: {cat}/{doc}】\n{text}")
+        return "\n\n---\n\n".join(parts)
+
+    def _get_selected_display(self) -> str:
+        """获取勾选项的显示摘要（仅标题，不读内容）"""
+        names = []
+        for key, checked in self._content_selected.items():
+            if not checked:
+                continue
+            if key.startswith("outline:"):
+                node_id = key.replace("outline:", "")
+                node = self._project_service.get_node(node_id)
+                if node:
+                    names.append(f"大纲·{node.title}")
+            elif key.startswith("setting:"):
+                cat_doc = key.replace("setting:", "")
+                names.append(f"设定·{cat_doc}")
+        return ", ".join(names)
+
+    # ── ★ v3移植: 项目上下文组装（发送时拼接） ──
+
+    def _get_outline_tree_context(self) -> str:
+        """大纲树上下文 — Linux 树形结构 + 节点ID + 特别标注"""
+        try:
+            ps = self._project_service
+            if not ps or not ps.get_current_project():
+                return ""
+            nodes = ps.get_outline_tree()
+            if not nodes:
+                return ""
+            children_map: dict[str, list] = {}
+            roots: list = []
+            for n in nodes:
+                if n.parent_id is None:
+                    roots.append(n)
+                else:
+                    children_map.setdefault(n.parent_id, []).append(n)
+            for v in children_map.values():
+                v.sort(key=lambda x: x.order)
+
+            lines = []
+            lines.append("▼ 这是项目大纲的树形结构，每行末尾带 (id=xxx)，可直接用 fetch 工具读取对应 id 的文档，无需额外调用 list_outline")
+
+            def _walk(node, prefix: str, is_last: bool):
+                connector = "└── " if is_last else "├── "
+                level_name = {1: "L1", 2: "L2", 3: "L3", 4: "L4", 5: "L5"}.get(node.level.value, "")
+                status_icon = {"completed": "✓", "in_progress": "●", "todo": "○", "ignored": "⊘"}.get(node.status.value, "○")
+                lines.append(f"{prefix}{connector}{status_icon} {node.title} [{level_name}] (id={node.node_id})")
+                kids = children_map.get(node.node_id, [])
+                child_prefix = prefix + ("    " if is_last else "│   ")
+                for i, kid in enumerate(kids):
+                    _walk(kid, child_prefix, i == len(kids) - 1)
+
+            for i, root in enumerate(sorted(roots, key=lambda x: x.order)):
+                _walk(root, "", i == len(roots) - 1)
+            return "\n".join(lines)
+        except Exception:
+            return ""
+
+    def _get_character_summary_context(self) -> str:
+        """角色集上下文 — 姓名+ID+性别+阵营，不含简介"""
+        try:
+            cs = self._project_service.character_service
+            chars = cs.list_characters()
+            if not chars:
+                return ""
+            lines = ["▼ 角色列表，每行带 char_id，可直接用 fetch 工具读取对应角色的完整信息"]
+            for c in chars:
+                camp_names = []
+                for cid in c.camp_ids:
+                    camp = cs.get_camp(cid)
+                    if camp:
+                        camp_names.append(camp.name)
+                camps_str = f" [阵营: {', '.join(camp_names)}]" if camp_names else ""
+                gender_str = f" {c.gender}" if c.gender else ""
+                lines.append(f"- {c.name}{gender_str}{camps_str} (char_id={c.char_id})")
+            return "\n".join(lines)
+        except Exception:
+            return ""
+
+    def _get_settings_summary_context(self) -> str:
+        """设定集上下文 — 分类名+文档名，标注可直接用 fetch 读取"""
+        try:
+            ps = self._project_service
+            cats = ps.list_categories()
+            if not cats:
+                return ""
+            lines = ["▼ 设定文档列表（category + doc 名），可直接用 fetch(target='setting', category=..., ids=[...]) 读取"]
+            for cat in cats:
+                docs = ps.list_docs(cat)
+                if docs:
+                    lines.append(f"## {cat}")
+                    for d in docs:
+                        lines.append(f"- {d} (category={cat})")
+            return "\n".join(lines) if len(lines) > 1 else ""
+        except Exception:
+            return ""
+
+    def _get_foreshadow_context(self) -> str:
+        """伏笔上下文 — 未隐藏伏笔条目，含 ID，可直接用 fetch 读取"""
+        try:
+            fs = self._project_service.foreshadow_service
+            items = fs.list_foreshadows(include_hidden=False)
+            if not items:
+                return ""
+            lines = ["▼ 当前未隐藏伏笔条目，每行带 id，可直接用 fetch 读取"]
+            for i, f in enumerate(items, 1):
+                lines.append(f"{i}. {f.content} (id={f.foreshadow_id})")
+            return "\n".join(lines)
+        except Exception:
+            return ""
+
+    # ── ★ v3移植: 消息区基础操作（右键菜单） ──
+
+    def _show_msg_menu(self, pos):
+        """消息区右键菜单：复制全文 / 重试"""
+        menu = QMenu(self)
+        act_copy = menu.addAction("📋 复制全文")
+        act_copy.triggered.connect(self._copy_all_messages)
+        act_retry = menu.addAction("🔄 重试")
+        act_retry.triggered.connect(self._retry_last)
+        menu.exec(self._scroll_area.viewport().mapToGlobal(pos))
+
+    def _copy_all_messages(self):
+        """复制消息区全部内容到剪贴板（静默，与 v2 行为一致）"""
+        lines = []
+        role_names = {"user": "👤 你", "assistant": "🤖 AI", "system": "⚙ 系统"}
+        for m in self._msg_data:
+            role = role_names.get(m.get("role", ""), m.get("role", ""))
+            lines.append(f"{role}: {m.get('content', '')}")
+        text = "\n\n".join(lines)
+        if text:
+            QApplication.clipboard().setText(text)
+
+    def _retry_last(self):
+        """重试：取出最后一条用户消息重新发送"""
+        if self._is_streaming or not self._current_session_id:
+            return
+        history = self._session_manager.get_message_history(self._current_session_id, 100)
+        last_user = ""
+        for m in reversed(history):
+            if m.get("role") == "user":
+                last_user = m["content"]
+                break
+        if last_user:
+            self._input_text.setPlainText(last_user)
+            self._on_send()
+
+    def _stop_streaming(self):
+        """停止当前 AI 流式输出"""
+        try:
+            if hasattr(self._ai_client, "cancel"):
+                self._ai_client.cancel()
+        except Exception:
+            pass
+        self._is_streaming = False
+        self._send_btn.setText("发送")
+        self._send_btn.setStyleSheet("background:#0078d4; color:white; padding:8px 16px; font-weight:bold;")
+        self._add_system_bubble("⏹ 已停止生成")
 
     # ── Streaming handlers (called from daemon thread → use signals) ──
 
