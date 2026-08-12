@@ -38,6 +38,10 @@ class ConfigPanel(BasePanel):
     def _build_source_tab(self):
         tab = QWidget()
         hlay = QHBoxLayout(tab)
+        try:
+            cfg = self._config_manager.load_app_config()
+        except Exception:
+            cfg = None
 
         # Left: source list
         left = QVBoxLayout()
@@ -64,13 +68,22 @@ class ConfigPanel(BasePanel):
         self._s_key.setEchoMode(QLineEdit.EchoMode.Password)
         self._s_model = QLineEdit()
         self._s_model_minor = QLineEdit()
-        self._s_reasoning = QCheckBox("支持深度思考")
+        self._s_max_tokens = QSpinBox()
+        self._s_max_tokens.setRange(256, 32768)
+        self._s_max_tokens.setSingleStep(256)
+        # 默认跟随全局 max_tokens（Tab2），新建源时用
+        default_max_tokens = getattr(cfg, 'max_tokens', 2048) if cfg else 2048
+        self._s_max_tokens.setValue(default_max_tokens)
+        self._s_reasoning = QCheckBox("启用深度思考（不勾选则不读取 reasoning_content）")
+        self._s_deep_continue = QCheckBox("支持深度思考续写（思考被截断时，把本次思考内容一并上传继续）")
         form.addRow("名称:", self._s_name)
         form.addRow("Base URL:", self._s_url)
         form.addRow("API Key:", self._s_key)
         form.addRow("模型:", self._s_model)
         form.addRow("备用模型:", self._s_model_minor)
+        form.addRow("最大输出:", self._s_max_tokens)
         form.addRow("", self._s_reasoning)
+        form.addRow("", self._s_deep_continue)
         right.addLayout(form)
 
         btns = QHBoxLayout()
@@ -248,12 +261,28 @@ class ConfigPanel(BasePanel):
         self._s_key.setText(key)
         self._s_model.setText(source.model)
         self._s_model_minor.setText(source.model_minor)
-        self._s_reasoning.setChecked(getattr(source, 'supports_reasoning', False))
+        self._s_max_tokens.setValue(getattr(source, 'max_tokens', 2048))
+        # 勾选框 = 运行时深度思考开关（默认开启）
+        self._s_reasoning.setChecked(
+            getattr(source, 'enable_deep_thinking', True)
+            if hasattr(source, 'enable_deep_thinking')
+            else getattr(source, 'supports_reasoning', True)
+        )
+        # 深度思考续写开关（默认关闭）
+        self._s_deep_continue.setChecked(
+            getattr(source, 'enable_deep_continue', False)
+        )
 
     def _clear_form(self):
         for w in [self._s_name, self._s_url, self._s_key, self._s_model, self._s_model_minor]:
             w.clear()
-        self._s_reasoning.setChecked(False)
+        try:
+            default_max = self._config_manager.load_app_config().max_tokens
+        except Exception:
+            default_max = 2048
+        self._s_max_tokens.setValue(default_max)
+        self._s_reasoning.setChecked(True)  # 深度思考默认开启
+        self._s_deep_continue.setChecked(False)  # 深度思考续写默认关闭
         self._current_source_name = None
 
     def _add_source(self):
@@ -273,8 +302,10 @@ class ConfigPanel(BasePanel):
             model_minor=self._s_model_minor.text().strip(),
             temperature=self._temp_slider.value() / 100,
             top_p=self._top_p_slider.value() / 100,
-            max_tokens=self._max_tokens_spin.value(),
+            max_tokens=self._s_max_tokens.value(),
             supports_reasoning=self._s_reasoning.isChecked(),
+            enable_deep_thinking=self._s_reasoning.isChecked(),
+            enable_deep_continue=self._s_deep_continue.isChecked(),
         )
         if self._current_source_name and self._current_source_name != name:
             self._config_manager.remove_ai_source(self._current_source_name)
@@ -291,6 +322,8 @@ class ConfigPanel(BasePanel):
                 model=source.model, model_minor=source.model_minor,
                 temperature=source.temperature, top_p=source.top_p,
                 max_tokens=source.max_tokens,
+                enable_deep_thinking=source.enable_deep_thinking,
+                enable_deep_continue=source.enable_deep_continue,
             )
         mb_info(self, "成功", f"AI 源「{name}」已保存")
 
@@ -310,6 +343,8 @@ class ConfigPanel(BasePanel):
             model=source.model, model_minor=source.model_minor,
             temperature=source.temperature, top_p=source.top_p,
             max_tokens=source.max_tokens,
+            enable_deep_thinking=getattr(source, 'enable_deep_thinking', True),
+            enable_deep_continue=getattr(source, 'enable_deep_continue', False),
         )
         mb_info(self, "成功", f"当前 AI 源已切换为「{name}」")
 
@@ -343,4 +378,12 @@ class ConfigPanel(BasePanel):
         cfg.chat_skill_text = self._skill_text.toPlainText()
         cfg.status_prompt_template = self._status_template.toPlainText()
         self._config_manager.save_app_config(cfg)
+        # ★ 立即生效：把自动续写开关同步到运行中的 AI 客户端，无需重启
+        try:
+            if self._ai_client is not None:
+                self._ai_client.set_auto_continue(
+                    cfg.auto_continue, cfg.max_continue_rounds
+                )
+        except Exception:
+            pass
         mb_info(self, "成功", "功能提示词配置已保存")

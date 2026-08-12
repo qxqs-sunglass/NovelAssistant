@@ -53,6 +53,8 @@ class AISourceConfig:
     max_tokens: int = 2048
     extra_headers: dict = field(default_factory=dict)
     supports_reasoning: bool = False        # ★ v2.2.2 是否支持深度思考（reasoning_content）
+    enable_deep_thinking: bool = True       # ★ 是否启用深度思考（运行时开关，默认开启）
+    enable_deep_continue: bool = False      # ★ 深度思考续写：思考被截断时把已产生的思考内容一起上传继续
 
     def to_dict(self) -> dict:
         return {
@@ -64,6 +66,8 @@ class AISourceConfig:
             "top_p": self.top_p,
             "max_tokens": self.max_tokens,
             "supports_reasoning": self.supports_reasoning,
+            "enable_deep_thinking": self.enable_deep_thinking,
+            "enable_deep_continue": self.enable_deep_continue,
         }
 
     @classmethod
@@ -77,6 +81,8 @@ class AISourceConfig:
             top_p=d.get("top_p", 0.9),
             max_tokens=d.get("max_tokens", 2048),
             supports_reasoning=d.get("supports_reasoning", False),
+            enable_deep_thinking=d.get("enable_deep_thinking", True),
+            enable_deep_continue=d.get("enable_deep_continue", False),
         )
 
 

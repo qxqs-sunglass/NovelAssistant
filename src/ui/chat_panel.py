@@ -8,7 +8,6 @@ from PySide6.QtWidgets import (
     QSplitter, QSizePolicy, QApplication, QMenu, QInputDialog,
 )
 from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QFont
 
 from src.ui.base_panel import BasePanel
 from src.ui.common import (
@@ -187,6 +186,9 @@ class ChatPanel(BasePanel):
         self._pending_tool_calls: list = []
         self._msg_data: list = []
         self._session_history: list = []
+        # ★ 会话内 AI 通过 fetch 工具读取过的目标 ID 列表（跨对话持久化）
+        # 结构: [{"target": "outline", "id": "xxx"}, ...]
+        self._session_fetched_ids: list[dict] = []
         # ★ v3修复: 提示词状态
         self._sys_prompt = ""
         self._add_prompt = ""
@@ -416,6 +418,7 @@ class ChatPanel(BasePanel):
     def _switch_session(self, session_id: str):
         self._current_session_id = session_id
         self._session_history = []
+        self._session_fetched_ids = list(self._session_manager.get_fetched_ids(session_id))
         self._clear_messages()
         self._add_system_bubble("⏳ 正在加载历史会话...")
 
@@ -446,6 +449,7 @@ class ChatPanel(BasePanel):
         self._current_session_id = s.session_id
         self._clear_messages()
         self._session_history = []
+        self._session_fetched_ids = []
         self._refresh_session_list()
 
     def _delete_session(self):
@@ -454,6 +458,7 @@ class ChatPanel(BasePanel):
             self._current_session_id = None
             self._clear_messages()
             self._session_history = []
+            self._session_fetched_ids = []
             self._refresh_session_list()
 
     def _clear_messages(self):
@@ -582,6 +587,11 @@ class ChatPanel(BasePanel):
             context_parts.append(foreshadow_ctx)
         if selected:
             context_parts.append(f"【勾选内容】\n{selected}")
+        # ★ 本会话已通过 fetch 读取过的目标 ID，注入上下文供 AI 直接引用，
+        # 避免在后续对话/工作中重复检索。
+        fetched_ctx = self._get_fetched_ids_context()
+        if fetched_ctx:
+            context_parts.append(fetched_ctx)
 
         full_text = text
         if context_parts:
@@ -612,29 +622,23 @@ class ChatPanel(BasePanel):
             try:
                 if use_tools:
                     for chunk in self._ai_client.chat_with_tools(messages, self._tool_registry, system_prompt, max_rounds):
-                        # ★ v5修复: 真正消费生成器产出的事件，避免 error 等事件被丢弃
+                        # ★ v6修复: 彻底解决"工具调用信息出现两次"问题。
+                        # chat_with_tools 内部已经通过 event_bus 发布了
+                        # ai:tool_call / ai:tool_result / ai:response_chunk /
+                        # ai:response_end / ai:reasoning_chunk 等事件（对应 UI 的
+                        # 折叠卡片由 _do_tool_call / _do_tool_result 渲染）。
+                        # 此处只负责消费生成器、推进执行（含内部事件发布），
+                        # 若再重复 publish 一次，每个工具调用会显示两张卡片。
                         if not isinstance(chunk, dict):
                             continue
                         ctype = chunk.get("type")
-                        if ctype == "tool_call":
-                            self._event_bus.publish(
-                                "ai:tool_call",
-                                {"tool": chunk.get("tool", "?"), "args": chunk.get("args", {}),
-                                 "hallucinated": bool(chunk.get("hallucinated", False))},
-                                "ChatPanel",
-                            )
-                        elif ctype == "tool_result":
-                            self._event_bus.publish(
-                                "ai:tool_result",
-                                {"tool": chunk.get("tool", "?"), "result": chunk.get("result", "")},
-                                "ChatPanel",
-                            )
-                        elif ctype == "error":
+                        if ctype == "error":
                             # AIClient 内部在 yield error 前已发布 ai:response_end（超过最大轮数时），
                             # 这里不再重复补发，否则会触发两次 _do_response_end、
                             # 导致重复写入两条助手消息（"两次消息"问题）。
                             pass
-                        # chunk/ hallucination_detected 事件已在 AIClient 内部发布，无需重复处理
+                        # tool_call / tool_result / chunk / hallucination_detected
+                        # 事件均已由 AIClient 内部发布，无需在此重复处理。
                 else:
                     for chunk in self._ai_client.chat_stream(messages, system_prompt):
                         pass
@@ -930,6 +934,25 @@ class ChatPanel(BasePanel):
         except Exception:
             return ""
 
+    def _get_fetched_ids_context(self) -> str:
+        """本会话已通过 fetch 读取过的目标 ID 上下文。
+
+        供 AI 在后续对话/工作中直接引用这些 ID，无需重复调用 fetch。
+        """
+        if not self._session_fetched_ids:
+            return ""
+        # 按 target 分组，保持首次检索顺序
+        grouped: dict[str, list[str]] = {}
+        for item in self._session_fetched_ids:
+            grouped.setdefault(item.get("target", ""), []).append(item.get("id", ""))
+        lines = ["▼ 本会话已读取过的内容 ID 列表（无需再次 fetch，可直接引用这些 id 进行创作/分析）"]
+        target_names = {"outline": "大纲", "setting": "设定",
+                        "character": "角色", "foreshadow": "伏笔"}
+        for target, ids in grouped.items():
+            name = target_names.get(target, target)
+            lines.append(f"- {name} ({target}): {', '.join(ids)}")
+        return "\n".join(lines)
+
     # ── ★ v3移植: 消息区基础操作（右键菜单） ──
 
     def _show_msg_menu(self, pos):
@@ -1024,8 +1047,8 @@ class ChatPanel(BasePanel):
             reasoning = data.get("reasoning") or self._current_reasoning
             if reasoning:
                 meta["reasoning"] = reasoning
-            if self._pending_tool_calls:
-                meta["tool_calls"] = self._pending_tool_calls
+            # ★ 不再记录 tool 调用到会话记录（_pending_tool_calls 不再写入 meta），
+            # 已检索 ID 由 _record_fetched_ids 单独持久化到会话 fetched_ids。
             self._session_manager.add_message(self._current_session_id, "assistant", full,
                                               meta=meta if meta else None)
 
@@ -1056,9 +1079,51 @@ class ChatPanel(BasePanel):
     def _do_tool_call(self, data: dict):
         tool = data.get("tool", "?")
         args = data.get("args", {})
-        self._pending_tool_calls.append({"tool": tool, "args": args,
-                                         "hallucinated": bool(data.get("hallucinated", False))})
+        # ★ 不再记录 tool 调用到会话记录；但若调用的是 fetch，需要把读取的
+        #   目标 ID 保存到会话的已检索列表，供后续对话/工作直接读取。
+        if tool == "fetch":
+            self._record_fetched_ids(args)
         self._add_collapsible("🔧", f"调用工具: {tool}", json.dumps(args, ensure_ascii=False))
+
+    def _record_fetched_ids(self, args: dict):
+        """把 fetch 工具读取的目标 ID 追加到会话已检索列表并持久化。
+
+        兼容两种 fetch 用法：
+        1. 单类别：args = {"target": "...", "ids": [...]}
+        2. 多类别：args = {"targets": [{"target": "...", "ids": [...]}, ...]}
+        """
+        if not self._current_session_id:
+            return
+        groups = []
+        if args.get("targets"):
+            for g in args["targets"]:
+                if isinstance(g, dict):
+                    groups.append(g)
+        elif args.get("target") and args.get("ids"):
+            groups.append(args)
+
+        if not groups:
+            return
+        existing = {(item.get("target"), item.get("id"))
+                    for item in self._session_fetched_ids}
+        for g in groups:
+            target = g.get("target", "")
+            ids = g.get("ids", []) or []
+            if not target or not ids:
+                continue
+            for iid in ids:
+                key = (target, str(iid))
+                if key not in existing:
+                    existing.add(key)
+                    self._session_fetched_ids.append(
+                        {"target": target, "id": str(iid)}
+                    )
+        try:
+            self._session_manager.set_fetched_ids(
+                self._current_session_id, self._session_fetched_ids
+            )
+        except Exception:
+            pass
 
     def _do_tool_result(self, data: dict):
         tool = data.get("tool", "?")

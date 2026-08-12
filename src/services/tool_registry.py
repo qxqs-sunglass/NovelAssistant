@@ -50,58 +50,107 @@ def create_tools(project_service) -> ToolRegistry:
     registry = ToolRegistry()
 
     # ── 统一批量读取 ★ v2.2 ──
+    def _read_fetch_group(ps, g: dict) -> dict:
+        """读取单个 target 组的全部内容。
+
+        Args:
+            ps: project_service
+            g: 形如 {"target": "...", "ids": [...], "category": "..."} 的分组
+        """
+        target = g.get("target", "")
+        ids = g.get("ids", []) or []
+        result: dict = {}
+        if target == "outline":
+            for nid in ids:
+                node = ps.get_node(nid)
+                result[nid] = node.content if node else "(不存在)"
+        elif target == "setting":
+            cat = g.get("category", "")
+            if not cat:
+                return {"error": "setting 缺少 category"}
+            for d in ids:
+                result[d] = ps.get_setting(cat, d) or "(不存在)"
+        elif target == "character":
+            for cid in ids:
+                ch = ps.character_service.get_character(cid)
+                if not ch:
+                    result[cid] = {"error": "角色不存在"}
+                    continue
+                result[cid] = {
+                    "char_id": ch.char_id, "name": ch.name, "gender": ch.gender,
+                    "age": ch.age, "birthday": ch.birthday, "bio": ch.bio,
+                    "camps": [ps.character_service.get_camp(c2).name
+                              if ps.character_service.get_camp(c2) else c2
+                              for c2 in ch.camp_ids],
+                }
+        elif target == "foreshadow":
+            for fid in ids:
+                f = ps.foreshadow_service.get_foreshadow(fid)
+                result[fid] = ({"id": f.foreshadow_id, "content": f.content,
+                                "hidden": f.hidden, "created_at": f.created_at}
+                               if f else {"error": "伏笔不存在"})
+        else:
+            return {"error": f"未知 target: {target}"}
+        return result
+
+    def _fetch_handler(ps, args: dict) -> dict:
+        """fetch 统一入口：兼容单 target 与多 targets 数组。
+
+        两种用法：
+        1. 单类别：{"target": "outline", "ids": ["n1", "n2"]} → {nid: content, ...}
+        2. 多类别：{"targets": [{"target": "outline", "ids": [...]},
+                               {"target": "character", "ids": [...]},
+                               {"target": "setting", "category": "世界观", "ids": [...]}]}
+                   → {target: {id: content, ...}, ...}
+        """
+        # 多类别同时读取
+        if args.get("targets"):
+            groups = args["targets"] if isinstance(args["targets"], list) else [args["targets"]]
+            out: dict = {}
+            for g in groups:
+                g = g if isinstance(g, dict) else {}
+                target = g.get("target", "")
+                out[target] = _read_fetch_group(ps, g)
+            return out
+        # 单类别（兼容旧格式）
+        return _read_fetch_group(ps, args)
+
     registry.register(ToolDef(
         name="fetch",
-        description="统一批量读取工具。一口气读取多个目标的内容。target: outline(大纲节点ID数组)/setting(需同时传category和ids)/character(角色ID数组)/foreshadow(伏笔ID数组)",
+        description=(
+            "统一批量读取工具。可一次读取一个或多个类别的目标内容。\n"
+            "两种用法：\n"
+            "1) 单类别：{\"target\": \"outline\", \"ids\": [\"节点ID\",...]}；"
+            "target 可选 outline/character/foreshadow 直接传 ids，setting 需同时传 category。\n"
+            "2) 多类别（推荐，一口气读多种）：{\"targets\": [{\"target\": \"outline\", \"ids\": [...]}, "
+            "{\"target\": \"character\", \"ids\": [...]}, {\"target\": \"setting\", \"category\": \"分类名\", \"ids\": [...]}, "
+            "{\"target\": \"foreshadow\", \"ids\": [...]}]}，返回值按 target 分组。"
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "target": {"type": "string", "enum": ["outline", "setting", "character", "foreshadow"],
-                           "description": "读取目标类型"},
+                           "description": "读取目标类型（单类别用法；多类别请用 targets）"},
                 "ids": {"type": "array", "items": {"type": "string"},
                         "description": "目标ID数组（setting类型时为文档名数组）"},
                 "category": {"type": "string", "description": "设定分类名（仅target=setting时必填）"},
+                "targets": {
+                    "type": "array",
+                    "description": "多类别同时读取的分组数组，每个元素为 {target, ids, category?}",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "target": {"type": "string", "enum": ["outline", "setting", "character", "foreshadow"]},
+                            "ids": {"type": "array", "items": {"type": "string"}},
+                            "category": {"type": "string", "description": "仅 target=setting 时必填"},
+                        },
+                        "required": ["target", "ids"],
+                    },
+                },
             },
-            "required": ["target", "ids"],
+            "required": [],
         },
-        handler=lambda args: (
-            {"error": "category 必填"} if args["target"] == "setting" and not args.get("category")
-            else (
-                # outline
-                {nid: (project_service.get_node(nid).content if project_service.get_node(nid) else "(不存在)")
-                 for nid in args["ids"]}
-                if args["target"] == "outline"
-                # setting
-                else {d: project_service.get_setting(args.get("category", ""), d) or "(不存在)" for d in args["ids"]}
-                if args["target"] == "setting"
-                # character
-                else {
-                    cid: (
-                        lambda ch: (
-                            {"char_id": ch.char_id, "name": ch.name, "gender": ch.gender,
-                             "age": ch.age, "birthday": ch.birthday, "bio": ch.bio,
-                             "camps": [project_service.character_service.get_camp(cid2).name
-                                       if project_service.character_service.get_camp(cid2) else cid2
-                                       for cid2 in ch.camp_ids]}
-                            if ch else {"error": "角色不存在"}
-                        )
-                    )(project_service.character_service.get_character(cid))
-                    for cid in args["ids"]
-                }
-                if args["target"] == "character"
-                # foreshadow
-                else {
-                    fid: (
-                        lambda f: (
-                            {"id": f.foreshadow_id, "content": f.content, "hidden": f.hidden,
-                             "created_at": f.created_at}
-                            if f else {"error": "伏笔不存在"}
-                        )
-                    )(project_service.foreshadow_service.get_foreshadow(fid))
-                    for fid in args["ids"]
-                }
-            )
-        ),
+        handler=lambda args: _fetch_handler(project_service, args),
     ))
 
     # ── 大纲结构 ──

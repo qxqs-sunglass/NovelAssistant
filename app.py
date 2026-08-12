@@ -106,6 +106,8 @@ def _configure_ai_client(ai_client, config_manager, logger):
                 temperature=source.temperature,
                 top_p=source.top_p,
                 max_tokens=source.max_tokens,
+                enable_deep_thinking=getattr(source, "enable_deep_thinking", True),
+                enable_deep_continue=getattr(source, "enable_deep_continue", False),
             )
             # ★ 读取全局配置：启用输出截断自动续写
             try:

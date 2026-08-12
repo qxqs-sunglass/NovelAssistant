@@ -399,6 +399,12 @@ class AIClient:
         # 方案A：幻觉工具调用自动修复
         self._fix_hallucinations: bool = True
 
+        # ★ 深度思考开关：False 时不读取/不显示 reasoning_content
+        self._deep_thinking: bool = True
+
+        # ★ 深度思考续写开关：思考被截断时把已产生的思考内容一起上传继续
+        self._deep_continue: bool = False
+
         # ★ 自动续写：当输出达到 max_tokens 上限被截断时，自动让 AI 续写剩余内容
         self._auto_continue: bool = False
         self._max_continue_rounds: int = 3
@@ -418,6 +424,8 @@ class AIClient:
         top_p: float = 0.9,
         max_tokens: int = 2048,
         extra_headers: Optional[dict] = None,
+        enable_deep_thinking: Optional[bool] = None,
+        enable_deep_continue: Optional[bool] = None,
     ) -> None:
         """配置 AI 客户端参数"""
         self._base_url = base_url.rstrip("/")
@@ -428,6 +436,10 @@ class AIClient:
         self._top_p = top_p
         self._max_tokens = max_tokens
         self._extra_headers = extra_headers or {}
+        if enable_deep_thinking is not None:
+            self._deep_thinking = bool(enable_deep_thinking)
+        if enable_deep_continue is not None:
+            self._deep_continue = bool(enable_deep_continue)
         self._client = None  # 强制重建
 
     def test_connection(self) -> dict:
@@ -573,13 +585,16 @@ class AIClient:
                 )
 
                 round_text = ""
+                round_reasoning = ""           # ★ 本轮产生的思考内容（用于深度思考续写）
                 round_truncated = False
                 for chunk in stream:
                     delta = chunk.choices[0].delta
                     # ★ v2.2.2: 深度思考内容（如 DeepSeek R1 / o1 的 reasoning_content）
-                    reasoning = getattr(delta, "reasoning_content", None)
+                    # 仅当开启深度思考时才读取，避免普通模型的无意义思考内容累积
+                    reasoning = getattr(delta, "reasoning_content", None) if self._deep_thinking else None
                     if reasoning:
                         full_reasoning += reasoning
+                        round_reasoning += reasoning
                         self._event_bus.publish(
                             "ai:reasoning_chunk",
                             {"text": reasoning},
@@ -625,6 +640,36 @@ class AIClient:
                             f"截止到上一条消息末尾已生成：\n{round_text}\n\n"
                             "请直接从上一条消息的末尾无缝继续，不要重复已输出的内容，"
                             "也不要打招呼或说明，直接继续正文输出。"
+                        ),
+                    })
+                    continue  # 进入下一轮续写
+
+                # ★ 深度思考续写：正文还没开始但思考被截断时，把思考内容一起上传继续
+                if (
+                    round_truncated
+                    and not round_text
+                    and round_reasoning
+                    and self._deep_continue
+                    and continue_count < self._max_continue_rounds
+                ):
+                    continue_count += 1
+                    self._logger.log(
+                        f"深度思考阶段被截断，深度思考续写第 {continue_count}/"
+                        f"{self._max_continue_rounds} 轮（已上传 {len(round_reasoning)} 字符思考内容）",
+                        "AIClient", "INFO",
+                    )
+                    self._event_bus.publish(
+                        "ai:continue",
+                        {"round": continue_count, "max_rounds": self._max_continue_rounds},
+                        "AIClient",
+                    )
+                    full_messages.append({
+                        "role": "user",
+                        "content": (
+                            "【自动续写】你刚才的深度思考因达到单次输出上限而被截断了，"
+                            f"截止到上一条消息末尾你的思考过程如下：\n{round_reasoning}\n\n"
+                            "请基于以上思考过程继续你的深度思考，并最终给出正文回答。"
+                            "不要重复已思考的内容，也不要打招呼或说明，直接继续。"
                         ),
                     })
                     continue  # 进入下一轮续写
@@ -736,14 +781,16 @@ class AIClient:
                 # 收集完整响应
                 tool_calls_data = []
                 round_text = ""
+                round_reasoning = ""           # ★ 本轮产生的思考内容（用于深度思考续写）
                 round_truncated = False  # ★ 本轮是否因达到输出上限被截断
                 for chunk in response:
                     delta = chunk.choices[0].delta
 
                     # ★ v2.2.2: 深度思考内容
-                    reasoning = getattr(delta, "reasoning_content", None)
+                    reasoning = getattr(delta, "reasoning_content", None) if self._deep_thinking else None
                     if reasoning:
                         full_reasoning += reasoning
+                        round_reasoning += reasoning
                         self._event_bus.publish(
                             "ai:reasoning_chunk",
                             {"text": reasoning},
@@ -813,6 +860,42 @@ class AIClient:
                             "tool_call_id": tc["id"],
                             "content": str(result),
                         })
+
+                    # ★ 工具调用轮被截断时也要触发自动续写
+                    # 原实现在 tool_calls 分支直接 continue，从不检查 round_truncated，
+                    # 导致本轮带着不完整工具参数被截断时 auto-continue 永远不生效，
+                    # UI 仍提示"输出达到上限"且 continued_rounds=0。
+                    if (
+                        round_truncated
+                        and round_text
+                        and self._auto_continue
+                        and continue_count < self._max_continue_rounds
+                    ):
+                        continue_count += 1
+                        self._logger.log(
+                            f"工具调用轮输出被截断，自动续写第 {continue_count}/"
+                            f"{self._max_continue_rounds} 轮（已拼 {len(round_text)} 字符）",
+                            "AIClient", "INFO",
+                        )
+                        self._event_bus.publish(
+                            "ai:continue",
+                            {"round": continue_count, "max_rounds": self._max_continue_rounds},
+                            "AIClient",
+                        )
+                        # 注：assistant(tool_calls) + tool(result)*N 已经按 OpenAI
+                        # 协议追加到了 full_messages，此处只追加续写指令，不再重复
+                        # assistant 消息（否则会导致协议顺序错乱被 API 400 拒绝）。
+                        full_messages.append({
+                            "role": "user",
+                            "content": (
+                                "【自动续写】你刚才的回复（含工具调用）因达到单次输出上限而被截断了，"
+                                f"截止到上一条消息末尾已生成：\n{round_text}\n\n"
+                                "请从工具调用/正文末尾无缝继续，不要重复已输出的内容，"
+                                "也不要打招呼或说明，直接继续输出。"
+                            ),
+                        })
+                        continuation_mode = True  # 续写轮不再触发工具调用
+                        continue  # 进入续写轮
 
                     continue  # 继续下一轮对话
 
@@ -934,6 +1017,30 @@ class AIClient:
                     yield {"type": "chunk", "content": round_text}
 
                 # ★ 截断处理：若开启自动续写且还有额度，则让 AI 续写剩余内容
+                # 深度思考续写由下方独立分支处理，此处仅记录正文续写未触发的原因
+                if (
+                    round_truncated
+                    and not round_text
+                    and not (self._deep_continue and round_reasoning
+                             and continue_count < self._max_continue_rounds)
+                ):
+                    # 截断但正文续写/深度续写均未触发，记录原因方便排查
+                    reasons = []
+                    if not round_text and not round_reasoning:
+                        reasons.append("round_text与思考内容均为空")
+                    if not self._auto_continue:
+                        reasons.append("auto_continue未启用")
+                    if not self._deep_continue:
+                        reasons.append("深度思考续写未启用")
+                    if continue_count >= self._max_continue_rounds:
+                        reasons.append(
+                            f"已耗尽续写额度({continue_count}/{self._max_continue_rounds})"
+                        )
+                    self._logger.log(
+                        "输出被截断但未触发续写: " + "，".join(reasons or ["未知原因"]),
+                        "AIClient", "WARNING",
+                    )
+
                 if (
                     round_truncated
                     and round_text
@@ -965,6 +1072,43 @@ class AIClient:
                             f"截止到上一条消息末尾已生成：\n{round_text}\n\n"
                             "请直接从上一条消息的末尾无缝继续，不要重复已输出的内容，"
                             "也不要打招呼或说明，直接继续正文输出。"
+                        ),
+                    })
+                    continuation_mode = True  # 续写轮不再触发工具调用
+                    continue  # 继续下一轮
+
+                # ★ 深度思考续写：正文还没开始（round_text 为空），但思考内容被截断
+                # 时，把本次已产生的思考内容一起上传，让模型继续思考/继续输出，
+                # 避免思考内容白白丢失、正文一个字都没生成。
+                if (
+                    round_truncated
+                    and not round_text
+                    and round_reasoning
+                    and self._deep_continue
+                    and continue_count < self._max_continue_rounds
+                ):
+                    continue_count += 1
+                    self._logger.log(
+                        f"深度思考阶段被截断，深度思考续写第 {continue_count}/"
+                        f"{self._max_continue_rounds} 轮（已上传 {len(round_reasoning)} 字符思考内容）",
+                        "AIClient", "INFO",
+                    )
+                    self._event_bus.publish(
+                        "ai:continue",
+                        {"round": continue_count, "max_rounds": self._max_continue_rounds},
+                        "AIClient",
+                    )
+                    # 把已产生的思考内容作为上下文一起上传。
+                    # 注意：不走非标准的 assistant.reasoning_content 字段（多数 OpenAI 兼容
+                    # API 会因未知字段拒绝 400），而是把思考内容嵌入用户续写指令里一并上传，
+                    # 保证兼容性。模型能据此接着思考/接着输出。
+                    full_messages.append({
+                        "role": "user",
+                        "content": (
+                            "【自动续写】你刚才的深度思考因达到单次输出上限而被截断了，"
+                            f"截止到上一条消息末尾你的思考过程如下：\n{round_reasoning}\n\n"
+                            "请基于以上思考过程继续你的深度思考，并最终给出正文回答。"
+                            "不要重复已思考的内容，也不要打招呼或说明，直接继续。"
                         ),
                     })
                     continuation_mode = True  # 续写轮不再触发工具调用
@@ -1040,6 +1184,39 @@ class AIClient:
             enabled: True 启用自动修复（默认）
         """
         self._fix_hallucinations = enabled
+
+    def set_deep_thinking(self, enabled: bool) -> None:
+        """启用/禁用深度思考。
+
+        禁用后不读取/不显示 reasoning_content，适用于不输出
+        思考内容的普通模型，避免日志/上下文无意义累积。
+
+        Args:
+            enabled: True 启用深度思考（默认）
+        """
+        self._deep_thinking = bool(enabled)
+
+    @property
+    def deep_thinking_enabled(self) -> bool:
+        """深度思考是否启用。"""
+        return self._deep_thinking
+
+    def set_deep_continue(self, enabled: bool) -> None:
+        """启用/禁用深度思考续写。
+
+        当 AI 在深度思考阶段（尚未产出正文）就被 max_tokens 截断时，
+        把本次已产生的思考内容一起作为上下文上传，让模型继续思考/继续输出，
+        避免思考内容白白丢失、正文一个字都没生成。
+
+        Args:
+            enabled: True 启用深度思考续写（默认关闭）
+        """
+        self._deep_continue = bool(enabled)
+
+    @property
+    def deep_continue_enabled(self) -> bool:
+        """深度思考续写是否启用。"""
+        return self._deep_continue
 
     def set_auto_continue(self, enabled: bool, max_rounds: int = 3) -> None:
         """启用/禁用输出截断后的自动续写。

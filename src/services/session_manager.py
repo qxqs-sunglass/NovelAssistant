@@ -53,6 +53,10 @@ class Session:
     system_prompt: str = ""
     messages: list[dict] = field(default_factory=list)
     # messages 结构: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+    # fetched_ids: ★ AI 通过 fetch 工具读取过的目标 ID 列表，
+    # 格式: [{"target": "outline", "id": "xxx"}, ...]，跨对话持久化，
+    # 供后续 AI 对话/工作直接读取引用，避免每次重新检索。
+    fetched_ids: list[dict] = field(default_factory=list)
 
 
 # ==================== 会话管理器 ====================
@@ -120,6 +124,7 @@ class SessionManager:
                 updated_at=data.get("updated_at", ""),
                 system_prompt=data.get("system_prompt", ""),
                 messages=data.get("messages", []),
+                fetched_ids=data.get("fetched_ids", []),
             )
         except (json.JSONDecodeError, KeyError) as e:
             self._logger.log(f"会话文件损坏 [{session_id}]: {e}", "SessionManager", "ERROR")
@@ -214,6 +219,45 @@ class SessionManager:
             return []
         return session.messages[-max_messages:]
 
+    # ==================== 已检索 ID 管理 ====================
+
+    def get_fetched_ids(self, session_id: str) -> list[dict]:
+        """获取本会话中 AI 通过 fetch 工具读取过的目标 ID 列表。
+
+        Returns:
+            列表，每个元素为 {"target": str, "id": str}；按首次检索顺序排列。
+        """
+        session = self.get_session(session_id)
+        if session is None:
+            return []
+        return list(session.fetched_ids)
+
+    def set_fetched_ids(self, session_id: str, fetched_ids: list[dict]) -> None:
+        """覆盖保存本会话的已检索 ID 列表（去重）。
+
+        Args:
+            session_id: 会话 ID
+            fetched_ids: 形如 [{"target": "outline", "id": "xxx"}, ...] 的列表
+        """
+        session = self.get_session(session_id)
+        if session is None:
+            return
+        seen = set()
+        cleaned = []
+        for item in fetched_ids:
+            key = (item.get("target", ""), item.get("id", ""))
+            if not key[1] or key in seen:
+                continue
+            seen.add(key)
+            cleaned.append({"target": key[0], "id": key[1]})
+        session.fetched_ids = cleaned
+        session.updated_at = datetime.now().isoformat()
+        self._save_session(session)
+        self._update_index_entry(
+            session_id, session.title, len(session.messages),
+            session.created_at, session.updated_at,
+        )
+
     def clear_messages(self, session_id: str) -> None:
         """清空会话消息（保留会话本身）"""
         session = self.get_session(session_id)
@@ -263,6 +307,7 @@ class SessionManager:
             "updated_at": session.updated_at,
             "system_prompt": session.system_prompt,
             "messages": session.messages,
+            "fetched_ids": session.fetched_ids,
         }
 
         file_path = session_dir / "messages.json"
