@@ -64,6 +64,19 @@ def main():
     # ★ v3修复: 启动时自动切到上次使用的项目（v2 行为恢复）
     _restore_last_project(project_service, config_manager, logger)
 
+    # ★ 修复: 切换项目时持久化 last_project，确保退出重进后仍是上次打开的项目
+    def _persist_last_project(event):
+        try:
+            pname = (event or {}).get("project_name", "")
+            if pname:
+                cfg = config_manager.load_app_config()
+                cfg.last_project = pname
+                config_manager.save_app_config(cfg)
+        except Exception as e:
+            logger.log(f"保存上次项目失败: {e}", "App", "WARNING")
+
+    event_bus.subscribe("project:switched", _persist_last_project)
+
     # ── 工具注册 ──
     tool_registry = create_tools(project_service)
 

@@ -5,12 +5,12 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QLineEdit, QLabel,
     QTextEdit, QPushButton, QScrollArea, QCheckBox,
-    QFormLayout,
+    QFormLayout, QFileDialog, QAbstractItemView,
 )
 from PySide6.QtCore import Qt
 
 from src.ui.base_panel import BasePanel
-from src.ui.common import mb_error, mb_ask, mb_warn, dialog_toplevel
+from src.ui.common import mb_info, mb_error, mb_ask, mb_warn, dialog_toplevel
 
 
 class CharacterPanel(BasePanel):
@@ -78,10 +78,17 @@ class CharacterPanel(BasePanel):
         self._bio_edit.textChanged.connect(lambda: setattr(self, '_bio_modified', True))
         rl.addWidget(self._bio_edit)
 
-        # Save bio button
+        # Save bio button + 导出
+        btn_row = QHBoxLayout()
         save_btn = QPushButton("💾 保存简介")
         save_btn.clicked.connect(self._save_bio)
-        rl.addWidget(save_btn)
+        export_btn = QPushButton("📤 导出")
+        export_btn.setToolTip("一键导出当前角色为 Markdown")
+        export_btn.clicked.connect(self._export_character)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(export_btn)
+        btn_row.addStretch()
+        rl.addLayout(btn_row)
 
         rl.addWidget(QLabel("阵营:"))
         self._camp_tags = QLabel("无")
@@ -187,6 +194,26 @@ class CharacterPanel(BasePanel):
                 camps.append(c.name)
         self._camp_tags.setText(", ".join(camps) if camps else "无")
 
+    def _owned_camp_ids(self) -> set[str]:
+        """当前角色已关联的阵营 id 集合"""
+        if self._current_char_id:
+            ch = self._project_service.character_service.get_character(self._current_char_id)
+            if ch:
+                return set(ch.camp_ids)
+        return set()
+
+    @staticmethod
+    def _build_camp_item(c, owned: set[str]) -> QListWidgetItem:
+        """构建一个带勾选框的阵营列表项（camp_id 存入 UserRole）"""
+        desc_preview = c.description[:30] + "..." if len(c.description) > 30 else c.description
+        item = QListWidgetItem(f"{c.name}  — {desc_preview}")
+        item.setData(Qt.ItemDataRole.UserRole, c.camp_id)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(
+            Qt.CheckState.Checked if c.camp_id in owned else Qt.CheckState.Unchecked
+        )
+        return item
+
     def _save_fields(self):
         if not self._current_char_id:
             return
@@ -227,6 +254,57 @@ class CharacterPanel(BasePanel):
             self._bio_modified = False
         except Exception as e:
             mb_error(self, "错误", str(e))
+
+    def _export_character(self):
+        """一键导出当前角色为 Markdown 文件"""
+        if not self._current_char_id:
+            mb_warn(self, "提示", "请先在左侧选择一个角色")
+            return
+        # 先保存未提交的改动
+        self._save_fields()
+        self._save_bio()
+
+        ch = self._project_service.character_service.get_character(self._current_char_id)
+        if not ch:
+            mb_error(self, "错误", "角色数据不存在")
+            return
+
+        default_name = ch.name or "角色"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出角色", f"{default_name}.md", "Markdown (*.md)",
+        )
+        if not path:
+            return
+
+        # 组装 Markdown 内容
+        camps = []
+        for cid in ch.camp_ids:
+            c = self._project_service.character_service.get_camp(cid)
+            if c:
+                camps.append(c.name)
+        camp_text = ", ".join(camps) if camps else "无"
+
+        parts = [
+            f"# {ch.name}",
+            "",
+            f"- 性别: {ch.gender or '未填写'}",
+            f"- 年龄: {ch.age or '未填写'}",
+            f"- 生日: {ch.birthday or '未填写'}",
+            f"- 阵营: {camp_text}",
+            "",
+            "## 简介",
+            "",
+            ch.bio or "（暂无简介）",
+        ]
+        content = "\n".join(parts)
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            mb_error(self, "错误", f"导出失败: {e}")
+            return
+        mb_info(self, "导出完成", f"角色「{ch.name}」已导出到:\n{path}")
 
     def _create_character(self):
         dlg = dialog_toplevel(self, "创建角色", 300, 120)
@@ -275,17 +353,23 @@ class CharacterPanel(BasePanel):
         self._refresh_list()
 
     def _show_camp_dialog(self):
-        """阵营管理对话框 — 列表 + 排序 + 增删改 + 自动关联当前角色（★ v3修复）"""
+        """阵营管理对话框 — 列表 + 排序 + 增删改 + 勾选关联当前角色（★ 修复无法添加）"""
         cs = self._project_service.character_service
 
-        dlg = dialog_toplevel(self, "管理阵营", 500, 420)
+        dlg = dialog_toplevel(self, "管理阵营", 520, 460)
         layout = QVBoxLayout(dlg)
 
-        # ── 列表区 + 排序按钮 ──
+        tip = QLabel("☑ 勾选即生效（实时保存到当前角色）；选中条目可编辑，名称留空则新建")
+        tip.setStyleSheet("color:#888;")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+        # ── 列表区（含勾选框）+ 排序按钮 ──
         list_outer = QWidget()
         lo = QHBoxLayout(list_outer)
         lo.setContentsMargins(0, 0, 0, 0)
         camp_list = QListWidget()
+        camp_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         lo.addWidget(camp_list, 1)
 
         order_side = QWidget()
@@ -311,26 +395,54 @@ class CharacterPanel(BasePanel):
         el.addRow("简介:", desc_edit)
         layout.addWidget(edit)
 
+        # ── 公共回调 ──
+        def apply_assoc():
+            """将列表勾选结果实时写入当前角色的 camp_ids"""
+            if not self._current_char_id:
+                return
+            selected = []
+            for i in range(camp_list.count()):
+                item = camp_list.item(i)
+                if item.checkState() == Qt.CheckState.Checked:
+                    selected.append(item.data(Qt.ItemDataRole.UserRole))
+            try:
+                cs.update_character(self._current_char_id, camp_ids=selected)
+                self._refresh_camp_tags()
+                self._refresh_list()
+            except Exception as e:
+                mb_error(self, "错误", f"更新阵营失败: {e}")
+
         def refresh_list():
-            camp_list.clear()
-            for c in cs.list_camps():
-                desc_preview = c.description[:30] + "..." if len(c.description) > 30 else c.description
-                camp_list.addItem(f"{c.name}  — {desc_preview}")
+            """重建列表，勾选当前角色所属阵营"""
+            camp_list.blockSignals(True)
+            try:
+                camp_list.clear()
+                owned = self._owned_camp_ids()
+                for c in cs.list_camps():
+                    camp_list.addItem(self._build_camp_item(c, owned))
+            finally:
+                camp_list.blockSignals(False)
 
         def on_select(item):
             if item:
-                camps = cs.list_camps()
-                idx = camp_list.row(item)
-                if idx < len(camps):
-                    name_edit.setText(camps[idx].name)
-                    desc_edit.setText(camps[idx].description)
+                cid = item.data(Qt.ItemDataRole.UserRole)
+                c = cs.get_camp(cid)
+                if c:
+                    name_edit.setText(c.name)
+                    desc_edit.setText(c.description)
+
+        def on_check_changed(item):
+            # ★ 勾选变化实时应用，无需额外按钮
+            if item is not None and self._current_char_id:
+                apply_assoc()
 
         camp_list.currentItemChanged.connect(on_select)
+        camp_list.itemChanged.connect(on_check_changed)
         refresh_list()
 
         # ── 按钮区 ──
         btns = QHBoxLayout()
-        save_btn = QPushButton("新建/更新")
+        save_btn = QPushButton("保存阵营")
         delete_btn = QPushButton("🗑 删除")
         close_btn = QPushButton("关闭")
 
@@ -341,19 +453,33 @@ class CharacterPanel(BasePanel):
                 return
             try:
                 item = camp_list.currentItem()
-                camps = cs.list_camps()
-                if item and camp_list.row(item) < len(camps):
-                    cs.update_camp(camps[camp_list.row(item)].camp_id,
-                                   name=name, description=desc_edit.text())
+                if item:
+                    cid = item.data(Qt.ItemDataRole.UserRole)
+                    cs.update_camp(cid, name=name, description=desc_edit.text())
+                    # 更新后若改名，同步列表显示
+                    c = cs.get_camp(cid)
+                    if c:
+                        owned = self._owned_camp_ids()
+                        item.setData(Qt.ItemDataRole.UserRole, c.camp_id)
+                        item.setText(f"{c.name}  — {c.description[:30] + '...' if len(c.description) > 30 else c.description}")
+                        item.setCheckState(
+                            Qt.CheckState.Checked if c.camp_id in owned else Qt.CheckState.Unchecked
+                        )
                 else:
                     new_camp = cs.create_camp(name, desc_edit.text())
-                    # ★ 自动关联当前角色
+                    # ★ 新建阵营自动加入当前角色并勾选
                     if self._current_char_id:
                         ch = cs.get_character(self._current_char_id)
                         if ch and new_camp.camp_id not in ch.camp_ids:
                             cs.update_character(self._current_char_id,
                                                 camp_ids=ch.camp_ids + [new_camp.camp_id])
-                refresh_list()
+                    refresh_list()
+                    # 自动选中新建项
+                    for i in range(camp_list.count()):
+                        it = camp_list.item(i)
+                        if it and it.data(Qt.ItemDataRole.UserRole) == new_camp.camp_id:
+                            camp_list.setCurrentItem(it)
+                            break
                 name_edit.clear()
                 desc_edit.clear()
                 self._refresh_camp_tags()
@@ -364,11 +490,11 @@ class CharacterPanel(BasePanel):
         def do_delete():
             item = camp_list.currentItem()
             if item:
-                camps = cs.list_camps()
-                idx = camp_list.row(item)
-                if idx < len(camps) and mb_ask(self, "确认删除", f"确定要删除阵营「{camps[idx].name}」吗？"):
+                cid = item.data(Qt.ItemDataRole.UserRole)
+                c = cs.get_camp(cid)
+                if c and mb_ask(self, "确认删除", f"确定要删除阵营「{c.name}」吗？"):
                     try:
-                        cs.delete_camp(camps[idx].camp_id)
+                        cs.delete_camp(cid)
                         refresh_list()
                         self._refresh_camp_tags()
                         self._refresh_list()
@@ -397,10 +523,21 @@ class CharacterPanel(BasePanel):
         ids = [c.camp_id for c in cs.list_camps()]
         ids[idx], ids[new_idx] = ids[new_idx], ids[idx]
         cs.reorder_camps(ids)
-        camp_list.clear()
-        for c in cs.list_camps():
-            desc_preview = c.description[:30] + "..." if len(c.description) > 30 else c.description
-            camp_list.addItem(f"{c.name}  — {desc_preview}")
+
+        # 记住各阵营的勾选状态，重建后恢复
+        owned = set()
+        if self._current_char_id:
+            ch = cs.get_character(self._current_char_id)
+            if ch:
+                owned = set(ch.camp_ids)
+
+        camp_list.blockSignals(True)
+        try:
+            camp_list.clear()
+            for c in cs.list_camps():
+                camp_list.addItem(self._build_camp_item(c, owned))
+        finally:
+            camp_list.blockSignals(False)
         camp_list.setCurrentRow(new_idx)
         self._refresh_camp_tags()
         self._refresh_list()

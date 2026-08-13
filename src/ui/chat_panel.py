@@ -460,6 +460,8 @@ class ChatPanel(BasePanel):
             self._session_history = []
             self._session_fetched_ids = []
             self._refresh_session_list()
+            # 修复bug: 删除后自动新建会话
+            self._new_session()
 
     def _clear_messages(self):
         while self._scroll_layout.count() > 1:
