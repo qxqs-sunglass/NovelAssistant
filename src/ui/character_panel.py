@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QLineEdit, QLabel,
     QTextEdit, QPushButton, QFileDialog, QAbstractItemView,
+    QComboBox,
 )
 from PySide6.QtCore import Qt
 
@@ -104,6 +105,15 @@ class CharacterPanel(BasePanel):
         camp_btns.addWidget(create_camp_btn)
         camp_btns.addWidget(select_camp_btn)
         rl.addLayout(camp_btns)
+        # 移除当前角色与某阵营的关联
+        detach_row = QHBoxLayout()
+        self._camp_detach_box = QComboBox()
+        self._camp_detach_box.setEnabled(False)
+        detach_btn = QPushButton("移除关联")
+        detach_btn.clicked.connect(self._detach_camp_from_char)
+        detach_row.addWidget(self._camp_detach_box, 1)
+        detach_row.addWidget(detach_btn)
+        rl.addLayout(detach_row)
         rl.addStretch()
 
         splitter.addWidget(right)
@@ -200,9 +210,44 @@ class CharacterPanel(BasePanel):
         ch = self._project_service.character_service.get_character(self._current_char_id)
         if not ch:
             self._camp_tags.setText("无")
+            self._camp_detach_box.clear()
+            self._camp_detach_box.setEnabled(False)
             return
         names = self._camp_names_of(ch)
         self._camp_tags.setText(", ".join(names) if names else "无")
+        # 刷新"移除关联"下拉框，内容为当前角色已关联的阵营
+        self._camp_detach_box.blockSignals(True)
+        try:
+            self._camp_detach_box.clear()
+            for cid in ch.camp_ids:
+                c = self._project_service.character_service.get_camp(cid)
+                if c:
+                    self._camp_detach_box.addItem(c.name, c.camp_id)
+        finally:
+            self._camp_detach_box.blockSignals(False)
+        self._camp_detach_box.setEnabled(self._camp_detach_box.count() > 0)
+
+    def _detach_camp_from_char(self):
+        """移除当前角色与所选阵营的关联（阵营本身保留）"""
+        if not self._current_char_id:
+            return
+        cid = self._camp_detach_box.currentData()
+        if not cid:
+            mb_warn(self, "提示", "当前角色尚未关联任何阵营")
+            return
+        name = self._camp_detach_box.currentText()
+        if not mb_ask(self, "确认移除", f"从角色中移除阵营「{name}」？\n（阵营本身不会被删除）"):
+            return
+        cs = self._project_service.character_service
+        try:
+            ch = cs.get_character(self._current_char_id)
+            if not ch:
+                return
+            new_ids = [x for x in ch.camp_ids if x != cid]
+            cs.update_character(self._current_char_id, camp_ids=new_ids)
+            self._refresh_all()
+        except Exception as e:
+            mb_error(self, "错误", str(e))
 
     def _owned_camp_ids(self) -> set[str]:
         """当前角色已关联的阵营 id 集合"""
@@ -393,26 +438,40 @@ class CharacterPanel(BasePanel):
         self._refresh_list()
 
     def _create_camp_dialog(self):
-        """创建阵营弹窗 — 独立于选择阵营，仅负责创建，不自动关联当前角色"""
+        """创建阵营弹窗 — 创建新阵营，并展示已有阵营列表（可删除整个阵营）"""
         cs = self._project_service.character_service
 
-        dlg = dialog_toplevel(self, "创建阵营", 360, 200)
+        dlg = dialog_toplevel(self, "创建阵营", 400, 420)
         layout = QVBoxLayout(dlg)
-        layout.addWidget(QLabel("阵营名称:"))
-        name_edit = QLineEdit()
-        name_edit.setPlaceholderText("必填")
-        layout.addWidget(name_edit)
-        layout.addWidget(QLabel("简介 (可选):"))
-        desc_edit = QLineEdit()
-        layout.addWidget(desc_edit)
 
-        btns = QHBoxLayout()
-        ok = QPushButton("创建")
-        cancel = QPushButton("取消")
-        btns.addWidget(ok)
-        btns.addWidget(cancel)
-        btns.addStretch(1)
-        layout.addLayout(btns)
+        # ── 新建区 ──
+        layout.addWidget(QLabel("新建阵营:"))
+        new_box = QWidget()
+        nl = QHBoxLayout(new_box)
+        nl.setContentsMargins(0, 0, 0, 0)
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("名称（必填）")
+        desc_edit = QLineEdit()
+        desc_edit.setPlaceholderText("简介（可选）")
+        ok_btn = QPushButton("创建")
+        nl.addWidget(name_edit, 2)
+        nl.addWidget(desc_edit, 2)
+        nl.addWidget(ok_btn)
+        layout.addWidget(new_box)
+
+        layout.addWidget(QLabel("已有阵营 (选中后删除):"))
+
+        # ── 已有阵营列表 ──
+        camp_list = QListWidget()
+        camp_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        layout.addWidget(camp_list, 1)
+
+        def refresh_list():
+            camp_list.clear()
+            for c in cs.list_camps():
+                item = QListWidgetItem(f"{c.name}  — {c.description or '无简介'}")
+                item.setData(Qt.ItemDataRole.UserRole, c.camp_id)
+                camp_list.addItem(item)
 
         def do_create():
             name = name_edit.text().strip()
@@ -421,14 +480,41 @@ class CharacterPanel(BasePanel):
                 return
             try:
                 cs.create_camp(name, desc_edit.text())
+                name_edit.clear()
+                desc_edit.clear()
+                refresh_list()
                 self._refresh_all()
-                dlg.accept()
             except ValueError as e:
                 mb_error(self, "错误", str(e))
 
-        ok.clicked.connect(do_create)
-        cancel.clicked.connect(dlg.reject)
+        def do_delete():
+            item = camp_list.currentItem()
+            if not item:
+                mb_warn(self, "提示", "请先在列表中选择要删除的阵营")
+                return
+            cid = item.data(Qt.ItemDataRole.UserRole)
+            c = cs.get_camp(cid)
+            if c and mb_ask(self, "确认删除", f"确定要删除阵营「{c.name}」吗？\n（将从所有角色中移除该阵营）"):
+                try:
+                    cs.delete_camp(cid)
+                    refresh_list()
+                    self._refresh_all()
+                except Exception as e:
+                    mb_error(self, "错误", f"删除阵营失败: {e}")
+
+        btns = QHBoxLayout()
+        del_btn = QPushButton("🗑 删除所选阵营")
+        close_btn = QPushButton("关闭")
+        del_btn.clicked.connect(do_delete)
+        close_btn.clicked.connect(dlg.accept)
+        btns.addWidget(del_btn)
+        btns.addStretch(1)
+        btns.addWidget(close_btn)
+        layout.addLayout(btns)
+
+        ok_btn.clicked.connect(do_create)
         name_edit.returnPressed.connect(do_create)
+        refresh_list()
         dlg.exec()
 
     def _show_camp_dialog(self):
