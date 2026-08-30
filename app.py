@@ -67,7 +67,10 @@ def main():
     # ★ 修复: 切换项目时持久化 last_project，确保退出重进后仍是上次打开的项目
     def _persist_last_project(event):
         try:
-            pname = (event or {}).get("project_name", "")
+            # EventBus 回调收到的是 Event 对象，数据在其 data 字段（dict）
+            # 兼容传入 dict 的情况
+            data = getattr(event, "data", event)
+            pname = data.get("project_name", "") if hasattr(data, "get") else ""
             if pname:
                 cfg = config_manager.load_app_config()
                 cfg.last_project = pname
