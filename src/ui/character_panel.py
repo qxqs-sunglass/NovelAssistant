@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QPushButton, QFileDialog, QAbstractItemView,
     QComboBox,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 from src.ui.base_panel import BasePanel
 from src.ui.common import mb_info, mb_error, mb_ask, mb_warn, dialog_toplevel
@@ -438,10 +438,10 @@ class CharacterPanel(BasePanel):
         self._refresh_list()
 
     def _create_camp_dialog(self):
-        """创建阵营弹窗 — 创建新阵营，并展示已有阵营列表（可删除整个阵营）"""
+        """创建阵营弹窗 — 创建/重命名/删除阵营，展示已有阵营列表"""
         cs = self._project_service.character_service
 
-        dlg = dialog_toplevel(self, "创建阵营", 400, 420)
+        dlg = dialog_toplevel(self, "创建阵营", 440, 460)
         layout = QVBoxLayout(dlg)
 
         # ── 新建区 ──
@@ -459,7 +459,7 @@ class CharacterPanel(BasePanel):
         nl.addWidget(ok_btn)
         layout.addWidget(new_box)
 
-        layout.addWidget(QLabel("已有阵营 (选中后删除):"))
+        layout.addWidget(QLabel("已有阵营 (双击重命名，选中后删除):"))
 
         # ── 已有阵营列表 ──
         camp_list = QListWidget()
@@ -487,6 +487,12 @@ class CharacterPanel(BasePanel):
             except ValueError as e:
                 mb_error(self, "错误", str(e))
 
+        def do_create_on_enter():
+            # ★ 修复: 回车触发时输入法/焦点尚未把预编辑文本提交到控件，
+            # text() 可能读到空值导致误报"请输入阵营名称"。
+            # 延迟到事件循环下一轮再读取，确保取到最新输入内容。
+            QTimer.singleShot(0, do_create)
+
         def do_delete():
             item = camp_list.currentItem()
             if not item:
@@ -502,6 +508,45 @@ class CharacterPanel(BasePanel):
                 except Exception as e:
                     mb_error(self, "错误", f"删除阵营失败: {e}")
 
+        def do_rename(item):
+            """双击列表项 → 行内重命名弹窗"""
+            if not item:
+                return
+            cid = item.data(Qt.ItemDataRole.UserRole)
+            c = cs.get_camp(cid)
+            if not c:
+                return
+            rdlg = dialog_toplevel(dlg, "重命名阵营", 300, 120)
+            rl = QVBoxLayout(rdlg)
+            rl.addWidget(QLabel(f"新名称（当前：{c.name}）:"))
+            new_name = QLineEdit(c.name)
+            rl.addWidget(new_name)
+            rbtns = QHBoxLayout()
+            rok = QPushButton("确定")
+            rcancel = QPushButton("取消")
+            rok.clicked.connect(rdlg.accept)
+            rcancel.clicked.connect(rdlg.reject)
+            rbtns.addWidget(rok)
+            rbtns.addWidget(rcancel)
+            rl.addLayout(rbtns)
+
+            def confirm():
+                name = new_name.text().strip()
+                if not name:
+                    mb_warn(rdlg, "提示", "名称不能为空")
+                    return
+                try:
+                    cs.update_camp(cid, name=name)
+                    refresh_list()
+                    self._refresh_all()
+                    rdlg.accept()
+                except Exception as e:
+                    mb_error(rdlg, "错误", str(e))
+
+            rok.clicked.connect(confirm)
+            new_name.returnPressed.connect(confirm)
+            rdlg.exec()
+
         btns = QHBoxLayout()
         del_btn = QPushButton("🗑 删除所选阵营")
         close_btn = QPushButton("关闭")
@@ -513,7 +558,8 @@ class CharacterPanel(BasePanel):
         layout.addLayout(btns)
 
         ok_btn.clicked.connect(do_create)
-        name_edit.returnPressed.connect(do_create)
+        name_edit.returnPressed.connect(do_create_on_enter)
+        camp_list.itemDoubleClicked.connect(do_rename)
         refresh_list()
         dlg.exec()
 
