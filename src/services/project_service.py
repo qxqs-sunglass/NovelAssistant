@@ -129,6 +129,56 @@ class CharacterService:
         self._camps_order_file = self._project_dir / "camps" / "_order.json"
         self._index_file = self._chars_dir / "index.json"
 
+        # ★ 性能优化: 索引/阵营内存缓存（按文件 mtime 失效，避免每次操作重复读盘）
+        self._index_cache: Optional[list] = None
+        self._index_cache_mtime: float = -1.0
+        self._camps_cache: Optional[tuple] = None   # (list[Camp], mtime, order_mtime)
+        self._camps_cache_mtime: tuple = (-1.0, -1.0)
+
+    # ── 缓存失效 ──
+    def _invalidate_index_cache(self) -> None:
+        self._index_cache = None
+        self._index_cache_mtime = -1.0
+
+    def _invalidate_camps_cache(self) -> None:
+        self._camps_cache = None
+        self._camps_cache_mtime = (-1.0, -1.0)
+
+    @staticmethod
+    def _file_mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return -1.0
+
+    def _load_index_cached(self) -> list:
+        """读取 characters/index.json（带 mtime 失效缓存）。
+
+        外部（如 AI 工具/其他进程）改动索引文件时，mtime 变化会自动失效。
+        """
+        mtime = self._file_mtime(self._index_file)
+        if self._index_cache is not None and mtime == self._index_cache_mtime:
+            return self._index_cache
+        data = self._read_json(self._index_file)
+        if not isinstance(data, list):
+            data = self._rebuild_character_index()
+        else:
+            # ★ 自愈：清理历史遗留的重复 char_id 条目
+            seen = set()
+            deduped = []
+            for e in data:
+                cid = e.get("char_id")
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    deduped.append(e)
+            if len(deduped) != len(data):
+                data = deduped
+                self._write_json(self._index_file, data)
+                mtime = self._file_mtime(self._index_file)
+        self._index_cache = data
+        self._index_cache_mtime = mtime
+        return data
+
     # ── 内部辅助 ──
     def _log(self, msg: str, level: str = "INFO"):
         if self._logger:
@@ -154,28 +204,40 @@ class CharacterService:
 
     # ── 角色 CRUD ──
     def list_characters(self) -> list[Character]:
-        """列出所有角色（bio 按需延迟加载）"""
-        index = self._read_json(self._index_file)
-        if not isinstance(index, list):
-            # 兼容旧格式或损坏 → 重建
-            index = self._rebuild_character_index()
+        """列出所有角色（bio 按需延迟加载）。
+
+        ★ 性能优化：birthday/age 直接取自 index.json，不再逐角色读 data.json，
+        将 N+1 次磁盘 I/O 降为 1 次。仅当旧索引缺失该字段时才回退读盘并回填。
+        """
+        index = self._load_index_cached()
         result = []
+        backfilled = False
         for entry in index:
             c = Character(
                 char_id=entry.get("char_id", ""),
                 name=entry.get("name", ""),
                 gender=entry.get("gender", ""),
+                birthday=entry.get("birthday", ""),
+                age=entry.get("age", ""),
                 camp_ids=entry.get("camp_ids", []),
                 created_at=entry.get("created_at", ""),
                 updated_at=entry.get("updated_at", ""),
             )
-            # 延迟加载 data.json 中的 birthday/age
-            data_file = self._chars_dir / c.char_id / "data.json"
-            data = self._read_json(data_file)
-            if isinstance(data, dict):
-                c.birthday = data.get("birthday", "")
-                c.age = data.get("age", "")
+            # 兼容旧索引：缺失 birthday/age 时回退读取 data.json
+            if "birthday" not in entry or "age" not in entry:
+                data = self._read_json(self._chars_dir / c.char_id / "data.json")
+                if isinstance(data, dict):
+                    c.birthday = data.get("birthday", "")
+                    c.age = data.get("age", "")
+                entry["birthday"] = c.birthday
+                entry["age"] = c.age
+                backfilled = True
             result.append(c)
+        # 旧索引已自动补齐字段，回写一次，后续不再回退读盘
+        if backfilled:
+            self._write_json(self._index_file, index)
+            self._index_cache = index
+            self._index_cache_mtime = self._file_mtime(self._index_file)
         return result
 
     def get_character(self, char_id: str) -> Optional[Character]:
@@ -189,11 +251,11 @@ class CharacterService:
         if not isinstance(data, dict):
             return None
 
-        # 从 index 获取 name（或从 data 获取）
-        index = self._read_json(self._index_file)
+        # 从 index 获取 name/camp_ids（使用缓存，避免重复读盘）
+        index = self._load_index_cached()
         name = ""
         camp_ids = []
-        for entry in (index if isinstance(index, list) else []):
+        for entry in index:
             if entry.get("char_id") == char_id:
                 name = entry.get("name", "")
                 camp_ids = entry.get("camp_ids", [])
@@ -242,18 +304,25 @@ class CharacterService:
             f.write("")
 
         # 更新 index
-        index = self._read_json(self._index_file)
+        index = self._load_index_cached()
         if not isinstance(index, list):
             index = []
-        index.append({
-            "char_id": char_id,
-            "name": name.strip(),
-            "gender": "",
-            "camp_ids": [],
-            "created_at": now,
-            "updated_at": now,
-        })
-        self._write_json(self._index_file, index)
+        # ★ 防重：index 缺失时会触发 _rebuild_character_index()，
+        # 而该重建已扫描到本次刚创建的 data.json，若再 append 会产生重复条目。
+        if not any(e.get("char_id") == char_id for e in index):
+            index.append({
+                "char_id": char_id,
+                "name": name.strip(),
+                "gender": "",
+                "birthday": "",
+                "age": "",
+                "camp_ids": [],
+                "created_at": now,
+                "updated_at": now,
+            })
+            self._write_json(self._index_file, index)
+        self._index_cache = index
+        self._index_cache_mtime = self._file_mtime(self._index_file)
 
         self._log(f"创建角色: {name}")
         self._publish("character:created", {"char_id": char_id, "name": name})
@@ -301,7 +370,7 @@ class CharacterService:
                 f.write(bio)
 
         # 更新 index
-        index = self._read_json(self._index_file)
+        index = self._load_index_cached()
         if isinstance(index, list):
             for entry in index:
                 if entry.get("char_id") == char_id:
@@ -309,11 +378,17 @@ class CharacterService:
                         entry["name"] = name.strip()
                     if gender is not None:
                         entry["gender"] = gender
+                    if birthday is not None:
+                        entry["birthday"] = birthday
+                    if age is not None:
+                        entry["age"] = age
                     if camp_ids is not None:
                         entry["camp_ids"] = camp_ids
                     entry["updated_at"] = now
                     break
             self._write_json(self._index_file, index)
+            self._index_cache = index
+            self._index_cache_mtime = self._file_mtime(self._index_file)
 
         self._log(f"更新角色: {char_id}")
         self._publish("character:updated", {"char_id": char_id, "name": data.get("name", "")})
@@ -329,10 +404,12 @@ class CharacterService:
         shutil.rmtree(char_dir)
 
         # 更新 index
-        index = self._read_json(self._index_file)
+        index = self._load_index_cached()
         if isinstance(index, list):
             index = [e for e in index if e.get("char_id") != char_id]
             self._write_json(self._index_file, index)
+            self._index_cache = index
+            self._index_cache_mtime = self._file_mtime(self._index_file)
 
         self._log(f"删除角色: {char_id}")
         self._publish("character:deleted", {"char_id": char_id})
@@ -351,7 +428,14 @@ class CharacterService:
 
     # ── 阵营 CRUD ──
     def list_camps(self) -> list[Camp]:
-        """列出所有阵营（按 _order.json 排序）"""
+        """列出所有阵营（按 _order.json 排序）。
+
+        ★ 性能优化：按两个文件的 mtime 做缓存，避免角色面板反复调用时重复读盘。
+        """
+        mtime = (self._file_mtime(self._camps_file),
+                 self._file_mtime(self._camps_order_file))
+        if self._camps_cache is not None and mtime == self._camps_cache_mtime:
+            return list(self._camps_cache)
         data = self._read_json(self._camps_file)
         if not isinstance(data, list):
             return []
@@ -369,11 +453,14 @@ class CharacterService:
         if isinstance(order, list):
             order_map = {cid: i for i, cid in enumerate(order) if isinstance(cid, str)}
             camps.sort(key=lambda c: order_map.get(c.camp_id, 9999))
-        return camps
+        self._camps_cache = camps
+        self._camps_cache_mtime = mtime
+        return list(camps)
 
     def _save_camps_order(self, ordered_ids: list[str]):
         """保存阵营显示顺序"""
         self._write_json(self._camps_order_file, ordered_ids)
+        self._invalidate_camps_cache()
 
     def reorder_camps(self, ordered_ids: list[str]) -> None:
         """重排阵营显示顺序（传入完整的 camp_id 列表）"""
@@ -416,6 +503,7 @@ class CharacterService:
             order = []
         order.append(camp_id)
         self._write_json(self._camps_order_file, order)
+        self._invalidate_camps_cache()
 
         self._log(f"创建阵营: {name}")
         self._publish("camp:created", {"camp_id": camp_id, "name": name})
@@ -433,6 +521,7 @@ class CharacterService:
                 if description is not None:
                     c["description"] = description
                 self._write_json(self._camps_file, camps)
+                self._invalidate_camps_cache()
                 self._log(f"更新阵营: {camp_id}")
                 self._publish("camp:updated", {"camp_id": camp_id, "name": c.get("name", "")})
                 return self.get_camp(camp_id)
@@ -451,12 +540,13 @@ class CharacterService:
         if isinstance(order, list):
             order = [cid for cid in order if cid != camp_id]
             self._write_json(self._camps_order_file, order)
+        self._invalidate_camps_cache()
 
-        # 清理所有角色的 camp_ids 引用
-        for char in self.list_characters():
-            if camp_id in char.camp_ids:
-                new_camp_ids = [cid for cid in char.camp_ids if cid != camp_id]
-                self.update_character(char.char_id, camp_ids=new_camp_ids)
+        # 清理所有角色的 camp_ids 引用（先取快照，避免遍历中修改缓存）
+        affected = [c for c in self.list_characters() if camp_id in c.camp_ids]
+        for char in affected:
+            new_camp_ids = [cid for cid in char.camp_ids if cid != camp_id]
+            self.update_character(char.char_id, camp_ids=new_camp_ids)
 
         self._log(f"删除阵营: {camp_id}")
         self._publish("camp:deleted", {"camp_id": camp_id})
@@ -474,17 +564,16 @@ class CharacterService:
         chars = self.list_characters()
         if chars:
             parts.append("\n【角色列表】")
+            # ★ 预建 id→名称 映射，避免逐个 get_camp() 重复遍历阵营列表
+            camp_name_map = {c.camp_id: c.name for c in camps}
             for c in chars:
                 info_parts = [c.name]
                 if c.gender:
                     info_parts.append(c.gender)
                 if c.age:
                     info_parts.append(f"{c.age}岁")
-                cam_names = []
-                for cid in c.camp_ids:
-                    camp = self.get_camp(cid)
-                    if camp:
-                        cam_names.append(camp.name)
+                cam_names = [camp_name_map[cid] for cid in c.camp_ids
+                             if cid in camp_name_map]
                 if cam_names:
                     info_parts.append(f"所属: {', '.join(cam_names)}")
                 parts.append(f"- {' | '.join(info_parts)}")
@@ -505,12 +594,16 @@ class CharacterService:
                                 "char_id": char_dir.name,
                                 "name": data.get("name", ""),
                                 "gender": data.get("gender", ""),
+                                "birthday": data.get("birthday", ""),
+                                "age": data.get("age", ""),
                                 "camp_ids": data.get("camp_ids", []),
                                 "created_at": data.get("created_at", ""),
                                 "updated_at": data.get("updated_at", ""),
                             })
         if index:
             self._write_json(self._index_file, index)
+            self._index_cache = index
+            self._index_cache_mtime = self._file_mtime(self._index_file)
         return index
 
 
@@ -1095,6 +1188,71 @@ class ProjectService:
         self._save_outline(outline)
         self._publish("outline:tree_changed", {"project_name": self._current_project})
 
+    def change_parent(self, node_id: str, new_parent_id: str | None) -> None:
+        """把节点挂到新的父节点下（追加到末尾）。"""
+        outline = self._load_outline()
+        nodes = outline.get("nodes", {})
+        if isinstance(nodes, list):
+            nodes = {n.get("node_id", ""): n for n in nodes}
+        if node_id not in nodes:
+            raise ValueError(f"节点不存在: {node_id}")
+        if new_parent_id == node_id:
+            raise ValueError("不能将节点设为自己的父节点")
+        # 防止把节点挂到自己的后代下（形成环）
+        anc = new_parent_id
+        while anc and anc in nodes:
+            if anc == node_id:
+                raise ValueError("不能将节点移动到自己的子节点下")
+            anc = nodes[anc].get("parent_id")
+        if new_parent_id is not None and new_parent_id not in nodes:
+            raise ValueError(f"目标父节点不存在: {new_parent_id}")
+        order = 0
+        if new_parent_id in nodes:
+            order = len(nodes[new_parent_id].get("children_ids", []))
+        self.move_node(node_id, new_parent_id, order)
+
+    def promote_node(self, node_id: str) -> None:
+        """将节点升级：变为其父节点的兄弟（层级 -1）。"""
+        node = self.get_node(node_id)
+        if node is None:
+            raise ValueError(f"节点不存在: {node_id}")
+        if node.level.value <= 1:
+            raise ValueError("顶级节点无法再升级")
+        old_parent = self.get_node(node.parent_id) if node.parent_id else None
+        if old_parent is None:
+            raise ValueError("节点没有父节点，无法升级")
+        new_parent_id = old_parent.parent_id
+        order = 0
+        if new_parent_id:
+            gp = self.get_node(new_parent_id)
+            if gp is not None:
+                siblings = gp.children_ids or []
+                order = siblings.index(old_parent.node_id) + 1 if old_parent.node_id in siblings else len(siblings)
+        self.change_parent(node_id, new_parent_id)
+        if new_parent_id:
+            self.move_node(node_id, new_parent_id, order)
+
+    def demote_node(self, node_id: str) -> None:
+        """将节点降级：挂到其上一个兄弟节点之下（层级 +1）。"""
+        node = self.get_node(node_id)
+        if node is None:
+            raise ValueError(f"节点不存在: {node_id}")
+        if node.level.value >= 5:
+            raise ValueError("正文节点不允许再降级")
+        if not node.parent_id:
+            raise ValueError("顶级节点无法降级")
+        parent = self.get_node(node.parent_id)
+        if parent is None:
+            raise ValueError("父节点不存在，无法降级")
+        siblings = parent.children_ids or []
+        if node_id not in siblings:
+            raise ValueError("节点不在父节点列表中")
+        idx = siblings.index(node_id)
+        if idx == 0:
+            raise ValueError("已是第一个子节点，无法降级")
+        prev_sibling_id = siblings[idx - 1]
+        self.change_parent(node_id, prev_sibling_id)
+
     def reorder_siblings(self, parent_id: str, ordered_ids: list[str]) -> None:
         outline = self._load_outline()
         nodes = outline.get("nodes", {})
@@ -1124,18 +1282,24 @@ class ProjectService:
             result.append(child)
         return result
 
-    def merge_nodes(self, child_ids: list[str], new_title: str) -> OutlineNode:
+    def merge_nodes(
+        self,
+        child_ids: list[str],
+        new_title: str,
+        parent_id: str | None = None,
+    ) -> OutlineNode:
         if not child_ids:
             raise ValueError("child_ids 不能为空")
         first = self.get_node(child_ids[0])
         if first is None:
             raise ValueError("节点不存在")
-        parent_id = first.parent_id
+        if parent_id is None:
+            parent_id = first.parent_id
         for cid in child_ids[1:]:
             n = self.get_node(cid)
             if n is None:
                 raise ValueError(f"节点不存在: {cid}")
-            if n.parent_id != parent_id:
+            if n.parent_id != first.parent_id:
                 raise ValueError("只能合并同父节点的兄弟节点")
         merged = self.create_node(parent_id, new_title, first.level)
         for cid in child_ids:
@@ -1250,6 +1414,8 @@ class ProjectService:
         if fp.exists():
             fp.unlink()
             self._log(f"设定 {category}/{name} 已删除")
+            self._publish("setting:updated", {"category": category, "name": name,
+                                              "deleted": True})
 
     def delete_category(self, category: str) -> None:
         sd = self._settings_dir
@@ -1259,6 +1425,8 @@ class ProjectService:
         if cat_dir.exists():
             shutil.rmtree(cat_dir)
             self._log(f"分类 {category} 已删除")
+            self._publish("setting:updated", {"category": category, "name": "",
+                                              "deleted": True})
 
     def rename_category(self, old_name: str, new_name: str) -> None:
         sd = self._settings_dir

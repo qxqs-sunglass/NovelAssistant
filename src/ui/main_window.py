@@ -37,6 +37,7 @@ class MainWindow(QMainWindow):
         ("🔮 伏笔",    "foreshadow"),
         ("⚙ 设定",     "settings"),
         ("📊 状态",    "status"),
+        ("📤 导出",    "export"),
         ("🔧 配置",    "config"),
         ("📋 日志",    "log"),
     ]

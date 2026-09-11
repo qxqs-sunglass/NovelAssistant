@@ -46,7 +46,7 @@ def main():
     event_bus = EventBus()
     # ★ v3修复: 统一通过 get_logger() 获取全局单例，避免 ConfigManager 内部
     # get_logger() 再创建一个重复实例（此前会出现两个日志线程）
-    logger = get_logger(log_dir=str(ws / "logs"))
+    logger = get_logger(log_dir=str(ws / "logs"), event_bus=event_bus)
     config_manager = ConfigManager(config_dir=str(ws / "config"))
     # ★ v3性能优化: 后台预热加密密钥，避免首次打开配置界面时因 wmic 查询卡顿
     threading.Thread(target=config_manager.prewarm_key, daemon=True).start()
@@ -174,6 +174,7 @@ def _register_panels(window, event_bus, logger, ai_client,
     from src.ui.character_panel import CharacterPanel
     from src.ui.settings_panel import SettingsPanel
     from src.ui.status_panel import StatusPanel
+    from src.ui.export_panel import ExportPanel
     from src.ui.log_panel import LogPanel
 
     panels_map = [
@@ -184,6 +185,7 @@ def _register_panels(window, event_bus, logger, ai_client,
         ("foreshadow", ForeshadowPanel(event_bus, logger, project_service)),
         ("settings", SettingsPanel(event_bus, logger, project_service)),
         ("status",   StatusPanel(event_bus, logger, ai_client, project_service, config_manager)),
+        ("export",   ExportPanel(event_bus, logger, project_service, config_manager)),
         ("config",   ConfigPanel(event_bus, logger, config_manager, ai_client)),
         ("log",      LogPanel(event_bus, logger, config_manager)),
     ]

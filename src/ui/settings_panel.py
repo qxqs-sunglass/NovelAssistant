@@ -2,7 +2,7 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QLineEdit, QLabel,
-    QTextEdit, QPushButton, QFileDialog,
+    QTextEdit, QPushButton,
 )
 from PySide6.QtCore import Qt
 
@@ -115,11 +115,9 @@ class SettingsPanel(BasePanel):
         rl.addWidget(self._editor, 1)
         save_btn = QPushButton("💾 保存")
         save_btn.clicked.connect(self._save_doc)
-        export_btn = QPushButton("导出")
-        export_btn.clicked.connect(self._export_all)
+        # ★ v3.2: 导出功能已统合到「📤 导出」导航页
         btns = QHBoxLayout()
         btns.addWidget(save_btn)
-        btns.addWidget(export_btn)
         rl.addLayout(btns)
         splitter.addWidget(right)
 
@@ -349,17 +347,4 @@ class SettingsPanel(BasePanel):
         self._refresh_docs()
         self._doc_list.setCurrentRow(idx + 1)
 
-    def _export_all(self):
-        path, _ = QFileDialog.getSaveFileName(self, "导出设定", "", "Markdown (*.md)")
-        if not path:
-            return
-        out = []
-        for c in self._project_service.list_categories():
-            out.append(f"# {c}")
-            for d in self._project_service.list_docs(c):
-                out.append(f"## {d}")
-                out.append(self._project_service.get_setting(c, d) or "")
-                out.append("")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(out))
-        mb_info(self, "导出完成", f"已导出到 {path}")
+    # ★ v3.2: 设定导出功能已统合到「📤 导出」导航页

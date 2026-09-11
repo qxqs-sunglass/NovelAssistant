@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import threading
 from typing import Any, Generator, Optional
 from dataclasses import dataclass
 from openai import OpenAI, APIError, APIConnectionError, AuthenticationError, \
@@ -98,6 +99,23 @@ class AIClient:
 
         # OpenAI 客户端（延迟创建）
         self._client: Optional[OpenAI] = None
+
+        # ★ 取消标志：用于「停止生成」，跨线程安全
+        self._cancel_event = threading.Event()
+
+    # ==================== 取消控制 ====================
+
+    def cancel(self) -> None:
+        """请求取消当前的流式生成（线程安全）。"""
+        self._cancel_event.set()
+
+    def reset_cancel(self) -> None:
+        """重置取消标志，开始新一轮生成前调用。"""
+        self._cancel_event.clear()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancel_event.is_set()
 
     # ==================== 连接管理 ====================
 
@@ -254,6 +272,7 @@ class AIClient:
         model = self._model or self._model_minor
         if not model:
             raise AIClientError("模型名未设置，请在配置中填写模型名称", "not_configured")
+        self.reset_cancel()
         full_messages = self._build_messages(messages, system_prompt)
         try:
             full_text = ""
@@ -275,6 +294,9 @@ class AIClient:
                 round_reasoning = ""           # ★ 本轮产生的思考内容（用于深度思考续写）
                 round_truncated = False
                 for chunk in stream:
+                    if self._cancel_event.is_set():
+                        stream.close()
+                        raise AIClientError("用户已停止生成", "cancelled")
                     delta = chunk.choices[0].delta
                     # ★ v2.2.2: 深度思考内容（如 DeepSeek R1 / o1 的 reasoning_content）
                     # 仅当开启深度思考时才读取，避免普通模型的无意义思考内容累积
@@ -394,6 +416,20 @@ class AIClient:
                     "AIClient",
                 )
 
+        except AIClientError as e:
+            if e.error_type == "cancelled":
+                self._logger.log("用户已停止生成", "AIClient", "INFO")
+                self._event_bus.publish(
+                    "ai:response_end",
+                    {"full_text": locals().get("full_text", ""),
+                     "model": self._model,
+                     "reasoning": locals().get("full_reasoning", ""),
+                     "truncated": False, "max_tokens": self._max_tokens,
+                     "cancelled": True, "continued_rounds": 0},
+                    "AIClient",
+                )
+                return
+            raise
         except APIConnectionError as e:
             self._event_bus.publish("ai:response_error", {"error": str(e)}, "AIClient")
             raise AIClientError(f"连接失败: {e}", "connection")
@@ -440,6 +476,7 @@ class AIClient:
         if not model:
             raise AIClientError("模型名未设置，请在配置中填写模型名称", "not_configured")
 
+        self.reset_cancel()
         final_answer = ""  # ★ 只记录最终纯文本回复；工具调用轮次的文本不进入最终答案
         full_reasoning = ""  # ★ v2.2.2 深度思考内容（跨轮次累积）
         # ★ 自动续写状态：截断后自动续写剩余内容
@@ -470,6 +507,9 @@ class AIClient:
                 round_reasoning = ""           # ★ 本轮产生的思考内容（用于深度思考续写）
                 round_truncated = False  # ★ 本轮是否因达到输出上限被截断
                 for chunk in response:
+                    if self._cancel_event.is_set():
+                        response.close()
+                        raise AIClientError("用户已停止生成", "cancelled")
                     delta = chunk.choices[0].delta
 
                     # ★ v2.2.2: 深度思考内容
@@ -729,6 +769,20 @@ class AIClient:
                 yield {"type": "done", "full_text": final_answer}
                 return
 
+            except AIClientError as e:
+                if e.error_type == "cancelled":
+                    self._logger.log("用户已停止生成", "AIClient", "INFO")
+                    self._event_bus.publish(
+                        "ai:response_end",
+                        {"full_text": final_answer, "model": self._model,
+                         "reasoning": full_reasoning, "truncated": False,
+                         "max_tokens": self._max_tokens, "cancelled": True,
+                         "continued_rounds": continue_count},
+                        "AIClient",
+                    )
+                    yield {"type": "done", "full_text": final_answer}
+                    return
+                raise
             except APIConnectionError as e:
                 self._event_bus.publish("ai:response_error", {"error": str(e)}, "AIClient")
                 raise AIClientError(f"连接失败: {e}", "connection")

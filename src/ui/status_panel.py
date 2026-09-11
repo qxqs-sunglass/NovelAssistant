@@ -59,7 +59,7 @@ class StatusPanel(BasePanel):
                 if status_file.exists():
                     with open(status_file, "r", encoding="utf-8") as f:
                         self._status_text.setPlainText(f.read())
-                        return
+            # ★ 无论是否加载到 status.md，概览统计都需要刷新
             self._refresh_basic_status()
         except Exception:
             self._refresh_basic_status()

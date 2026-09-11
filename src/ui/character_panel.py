@@ -3,7 +3,7 @@ import shiboken6
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QLineEdit, QLabel,
-    QTextEdit, QPushButton, QFileDialog, QAbstractItemView,
+    QTextEdit, QPushButton, QAbstractItemView,
     QComboBox,
 )
 from PySide6.QtCore import Qt, QTimer
@@ -19,6 +19,10 @@ class CharacterPanel(BasePanel):
         self._project_service = project_service
         self._current_char_id: str | None = None
         self._bio_modified = False
+        # ★ 当前已加载角色的内存快照，用于 _save_fields 免读盘比较
+        self._char_snapshot = None
+        # ★ 脏标记：切换页面时若无数据变更则跳过刷新
+        self._dirty = True
         super().__init__(event_bus, logger)
 
     def _setup_ui(self):
@@ -39,12 +43,8 @@ class CharacterPanel(BasePanel):
         new_btn.clicked.connect(self._create_character)
         del_btn = QPushButton("🗑 删除")
         del_btn.clicked.connect(self._delete_character)
-        export_all_btn = QPushButton("📤 导出全部")
-        export_all_btn.setToolTip("一键导出全部角色为 Markdown")
-        export_all_btn.clicked.connect(self._export_all_characters)
         btns.addWidget(new_btn)
         btns.addWidget(del_btn)
-        btns.addWidget(export_all_btn)
         ll.addLayout(btns)
         splitter.addWidget(left)
 
@@ -81,15 +81,11 @@ class CharacterPanel(BasePanel):
         self._bio_edit.textChanged.connect(lambda: setattr(self, '_bio_modified', True))
         rl.addWidget(self._bio_edit)
 
-        # Save bio button + 导出
+        # Save bio button（★ v3.2: 导出功能已移至「📤 导出」导航页）
         btn_row = QHBoxLayout()
         save_btn = QPushButton("💾 保存简介")
         save_btn.clicked.connect(self._save_bio)
-        export_btn = QPushButton("📤 导出")
-        export_btn.setToolTip("一键导出当前角色为 Markdown")
-        export_btn.clicked.connect(self._export_character)
         btn_row.addWidget(save_btn)
-        btn_row.addWidget(export_btn)
         btn_row.addStretch()
         rl.addLayout(btn_row)
 
@@ -121,22 +117,61 @@ class CharacterPanel(BasePanel):
         layout.addWidget(splitter, 1)
 
     def _subscribe_events(self):
-        self._event_bus.subscribe("character:created", lambda e: self._refresh_list())
-        self._event_bus.subscribe("character:updated", lambda e: self._refresh_list())
-        self._event_bus.subscribe("character:deleted", lambda e: self._on_char_deleted())
-        self._event_bus.subscribe("camp:created", lambda e: self._refresh_all())
-        self._event_bus.subscribe("camp:updated", lambda e: self._refresh_all())
-        self._event_bus.subscribe("camp:deleted", lambda e: self._refresh_all())
+        self._event_bus.subscribe("character:created", self._on_char_created)
+        self._event_bus.subscribe("character:updated", self._on_char_updated)
+        self._event_bus.subscribe("character:deleted", self._on_char_deleted)
+        self._event_bus.subscribe("camp:created", lambda e: self._on_camp_changed())
+        self._event_bus.subscribe("camp:updated", lambda e: self._on_camp_changed())
+        self._event_bus.subscribe("camp:deleted", lambda e: self._on_camp_changed())
+
+    def _on_camp_changed(self):
+        self._dirty = True
+        self._refresh_all()
 
     def on_show(self):
-        self._refresh_all()
+        # ★ 性能优化：无数据变更时跳过整页刷新，避免来回切页重复重建列表
+        if self._dirty:
+            self._dirty = False
+            self._refresh_all()
+
+    def _mark_dirty(self) -> None:
+        self._dirty = True
 
     def _refresh_all(self):
         """刷新角色列表 + 当前角色的阵营标签（避免 camp 变更后标签残留旧数据）"""
         self._refresh_list()
         self._refresh_camp_tags()
 
+    def _on_char_created(self, event):
+        """新增角色 → 需要重建列表（排序可能变化）"""
+        self._dirty = True
+        self._refresh_list()
+
+    def _on_char_updated(self, event):
+        """★ 性能优化：修改角色信息时只更新对应列表项文本，
+        不再 clear() 重建整个列表，避免编辑时的卡顿与选中项抖动。"""
+        char_id = (event.data or {}).get("char_id")
+        if not char_id:
+            self._refresh_list()
+            return
+        name = (event.data or {}).get("name", "")
+        if not name:
+            ch = self._project_service.character_service.get_character(char_id)
+            name = ch.name if ch else ""
+        if not name:
+            return
+        for i in range(self._char_list.count()):
+            it = self._char_list.item(i)
+            if it and it.data(Qt.ItemDataRole.UserRole) == char_id:
+                if it.text() != name:
+                    it.setText(name)
+                self._dirty = False
+                return
+        # 列表中不存在该角色（如首次保存后新增）→ 重建
+        self._refresh_list()
+
     def _refresh_list(self):
+        self._dirty = False
         # ★ v3修复: 重建列表前先记住滚动位置与当前选中项，重建后恢复，
         # 避免 clear() 导致滚动条跳回顶部、选中项错乱
         scroll = self._char_list.verticalScrollBar()
@@ -191,6 +226,7 @@ class CharacterPanel(BasePanel):
         ch = self._project_service.character_service.get_character(cid)
         if not ch:
             return
+        self._char_snapshot = ch
         self._name_edit.setText(ch.name)
         self._gender_edit.setText(ch.gender or "")
         self._age_edit.setText(ch.age or "")
@@ -199,30 +235,34 @@ class CharacterPanel(BasePanel):
         self._bio_modified = False
         self._refresh_camp_tags()
 
-    def _camp_names_of(self, ch) -> list[str]:
+    def _camp_names_of(self, ch, camp_map=None) -> list[str]:
         """将角色 camp_ids 解析为阵营名称列表（按已声明的顺序）"""
-        cs = self._project_service.character_service
-        return [c.name for cid in ch.camp_ids if (c := cs.get_camp(cid))]
+        if camp_map is None:
+            cs = self._project_service.character_service
+            camp_map = {c.camp_id: c.name for c in cs.list_camps()}
+        return [camp_map[cid] for cid in ch.camp_ids if cid in camp_map]
 
     def _refresh_camp_tags(self):
         if not self._current_char_id:
             return
-        ch = self._project_service.character_service.get_character(self._current_char_id)
+        cs = self._project_service.character_service
+        ch = cs.get_character(self._current_char_id)
         if not ch:
             self._camp_tags.setText("无")
             self._camp_detach_box.clear()
             self._camp_detach_box.setEnabled(False)
             return
-        names = self._camp_names_of(ch)
+        # ★ 一次性获取阵营并建映射，避免逐个 get_camp() 重复遍历
+        camp_map = {c.camp_id: c.name for c in cs.list_camps()}
+        names = self._camp_names_of(ch, camp_map)
         self._camp_tags.setText(", ".join(names) if names else "无")
         # 刷新"移除关联"下拉框，内容为当前角色已关联的阵营
         self._camp_detach_box.blockSignals(True)
         try:
             self._camp_detach_box.clear()
             for cid in ch.camp_ids:
-                c = self._project_service.character_service.get_camp(cid)
-                if c:
-                    self._camp_detach_box.addItem(c.name, c.camp_id)
+                if cid in camp_map:
+                    self._camp_detach_box.addItem(camp_map[cid], cid)
         finally:
             self._camp_detach_box.blockSignals(False)
         self._camp_detach_box.setEnabled(self._camp_detach_box.count() > 0)
@@ -275,13 +315,15 @@ class CharacterPanel(BasePanel):
         name = self._name_edit.text().strip()
         if not name:
             return
-        ch = self._project_service.character_service.get_character(self._current_char_id)
         new_name = name
         new_gender = self._gender_edit.text().strip()
         new_age = self._age_edit.text().strip()
         new_birthday = self._birthday_edit.text().strip()
-        # ★ v3修复: 字段无变化时跳过保存，避免每次都发布 character:updated
-        # 事件导致列表被无谓重建（滚动条跳回顶部 / 选中项错乱）
+        # ★ 性能优化：先用缓存中的角色快照比较，避免每次编辑都读 data.json/profile.md。
+        # 字段无变化直接跳过，避免无谓的写盘 + character:updated 事件。
+        ch = self._char_snapshot
+        if ch is None or ch.char_id != self._current_char_id:
+            ch = self._project_service.character_service.get_character(self._current_char_id)
         if ch and (
             ch.name == new_name
             and (ch.gender or "") == new_gender
@@ -290,12 +332,13 @@ class CharacterPanel(BasePanel):
         ):
             return
         try:
-            self._project_service.character_service.update_character(
+            updated = self._project_service.character_service.update_character(
                 self._current_char_id, name=new_name,
                 gender=new_gender,
                 age=new_age,
                 birthday=new_birthday,
             )
+            self._char_snapshot = updated
         except Exception as e:
             mb_error(self, "错误", str(e))
 
@@ -310,86 +353,7 @@ class CharacterPanel(BasePanel):
         except Exception as e:
             mb_error(self, "错误", str(e))
 
-    def _character_markdown(self, ch) -> str:
-        """将单个角色组装为 Markdown 文本（使用实例的阵营服务）"""
-        names = self._camp_names_of(ch)
-        camp_text = ", ".join(names) if names else "无"
-        return "\n".join([
-            f"# {ch.name}",
-            "",
-            f"- 性别: {ch.gender or '未填写'}",
-            f"- 年龄: {ch.age or '未填写'}",
-            f"- 生日: {ch.birthday or '未填写'}",
-            f"- 阵营: {camp_text}",
-            "",
-            "## 简介",
-            "",
-            ch.bio or "（暂无简介）",
-        ])
-
-    def _export_character(self):
-        """一键导出当前角色为 Markdown 文件"""
-        if not self._current_char_id:
-            mb_warn(self, "提示", "请先在左侧选择一个角色")
-            return
-        # 先保存未提交的改动
-        self._save_fields()
-        self._save_bio()
-
-        ch = self._project_service.character_service.get_character(self._current_char_id)
-        if not ch:
-            mb_error(self, "错误", "角色数据不存在")
-            return
-
-        default_name = ch.name or "角色"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出角色", f"{default_name}.md", "Markdown (*.md)",
-        )
-        if not path:
-            return
-
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(self._character_markdown(ch))
-        except Exception as e:
-            mb_error(self, "错误", f"导出失败: {e}")
-            return
-        mb_info(self, "导出完成", f"角色「{ch.name}」已导出到:\n{path}")
-
-    def _export_all_characters(self):
-        """一键导出全部角色为一个 Markdown 文件"""
-        cs = self._project_service.character_service
-        chars = cs.list_characters()
-        if not chars:
-            mb_warn(self, "提示", "暂无角色可导出")
-            return
-
-        # 导出前先保存当前角色的未提交改动，避免漏掉最新内容
-        self._save_fields()
-        self._save_bio()
-
-        default_name = "全部角色"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出全部角色", f"{default_name}.md", "Markdown (*.md)",
-        )
-        if not path:
-            return
-
-        blocks = [f"# 全部角色", "", f"> 共 {len(chars)} 位角色", ""]
-        for i, ch in enumerate(chars, 1):
-            full = cs.get_character(ch.char_id)
-            if full:
-                ch = full
-            blocks.append(f"\n---\n\n### {i}. {ch.name}\n")
-            blocks.append(self._character_markdown(ch))
-
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(blocks))
-        except Exception as e:
-            mb_error(self, "错误", f"导出失败: {e}")
-            return
-        mb_info(self, "导出完成", f"已导出全部角色（{len(chars)} 位）到:\n{path}")
+    # ★ v3.2: 角色导出功能已统合到「📤 导出」导航页
 
     def _create_character(self):
         dlg = dialog_toplevel(self, "创建角色", 300, 120)

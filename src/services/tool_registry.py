@@ -191,6 +191,29 @@ def create_tools(project_service) -> ToolRegistry:
     ))
 
     # ── 章节管理 ──
+    def _write_chapter(args):
+        """创建新节点，或覆写已有节点内容。"""
+        node_id = args.get("node_id")
+        content = args.get("content", "")
+        title = args.get("title")
+        if node_id:
+            node = project_service.get_node(node_id)
+            if node is None:
+                return {"error": f"节点 {node_id} 不存在"}
+            updated = project_service.update_node(
+                node_id, title=title, content=content,
+            )
+            return {"updated": node_id, "title": updated.title}
+        level_raw = args.get("level", 5)
+        try:
+            level = OutlineLevel(int(level_raw))
+        except (ValueError, KeyError):
+            return {"error": f"无效的层级: {level_raw}（应为 1-5）"}
+        node = project_service.create_node(
+            args.get("parent_id"), title or "未命名", level, content,
+        )
+        return {"created": node.node_id, "title": node.title}
+
     registry.register(ToolDef(
         name="write_chapter",
         description="创建新的大纲节点/章节，或覆写已有节点的内容",
@@ -200,14 +223,7 @@ def create_tools(project_service) -> ToolRegistry:
             "title": {"type": "string"}, "content": {"type": "string"},
             "level": {"type": "integer", "description": "1=大纲 2=卷 3=简纲 4=章纲 5=正文"}},
             "required": ["content"]},
-        handler=lambda args: (
-            {"updated": nid, "title": project_service.update_node(nid, title=args.get("title"), content=args["content"]).title}
-            if (nid := args.get("node_id")) and project_service.get_node(nid)
-            else (lambda: (node := project_service.create_node(args.get("parent_id"), args.get("title", "未命名"),
-                     OutlineLevel(args.get("level", 5)), args["content"])) and {"created": node.node_id, "title": node.title})()
-            if not args.get("node_id")
-            else {"error": f"节点 {args['node_id']} 不存在"}
-        ),
+        handler=_write_chapter,
     ))
 
     # ── 精准编辑 ──

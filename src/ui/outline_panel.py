@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QTreeWidget, QTreeWidgetItem, QListWidget, QListWidgetItem,
     QLineEdit, QTextEdit, QPushButton, QLabel, QComboBox, QMenu, QHeaderView, QMessageBox,
-    QGridLayout, QFileDialog,
+    QGridLayout,
 )
 from PySide6.QtCore import Qt
 
@@ -66,17 +66,7 @@ class OutlinePanel(BasePanel):
         tree_toolbar.addWidget(btn_expand)
         tree_toolbar.addWidget(btn_collapse)
         ll.addLayout(tree_toolbar)
-        # ★ v4补齐: 导出按钮行（普通导出选中节点 + 一键导出 L1~L3）
-        export_toolbar = QHBoxLayout()
-        btn_export = QPushButton("📤 导出")
-        btn_export.setToolTip("导出当前选中的节点（含其所有子节点）为 Markdown")
-        btn_export.clicked.connect(self._export_selected)
-        export_toolbar.addWidget(btn_export, 1)
-        btn_export_l13 = QPushButton("⚡ 一键导出")
-        btn_export_l13.setToolTip("一键导出全部 L1~L3 层级节点为 Markdown")
-        btn_export_l13.clicked.connect(self._export_l1_l3)
-        export_toolbar.addWidget(btn_export_l13, 1)
-        ll.addLayout(export_toolbar)
+        # ★ v3.2: 导出功能已统合到「📤 导出」导航页，此处原有导出按钮移除
         self._tree = QTreeWidget()
         self._tree.setHeaderLabel("大纲树")
         self._tree.setColumnCount(1)
@@ -474,7 +464,18 @@ class OutlinePanel(BasePanel):
         if not items or not self._current_node_id:
             return
         cid = items[0].data(Qt.ItemDataRole.UserRole)
-        self._project_service.move_node(cid, delta)
+        node = self._project_service.get_node(self._current_node_id)
+        if node is None:
+            return
+        siblings = list(node.children_ids or [])
+        if cid not in siblings:
+            return
+        idx = siblings.index(cid)
+        new_idx = idx + delta
+        if new_idx < 0 or new_idx >= len(siblings):
+            return
+        siblings[idx], siblings[new_idx] = siblings[new_idx], siblings[idx]
+        self._project_service.reorder_siblings(self._current_node_id, siblings)
         self._refresh_tree()
         self._refresh_children()
 
@@ -526,7 +527,11 @@ class OutlinePanel(BasePanel):
             sel = tree.currentItem()
             if sel:
                 pid = sel.data(0, Qt.ItemDataRole.UserRole)
-                self._project_service.change_parent(self._current_node_id, pid)
+                try:
+                    self._project_service.change_parent(self._current_node_id, pid)
+                except ValueError as e:
+                    mb_info(dlg, "提示", str(e))
+                    return
                 self._refresh_tree()
                 self._update_stats()
                 dlg.accept()
@@ -628,86 +633,7 @@ class OutlinePanel(BasePanel):
             self._stats_toggle_btn.setText("📊 大纲统计 ▼")
             self._refresh_stats_panel()
 
-    # ── ★ v4补齐: 导出 Markdown ──
-
-    def _export_selected(self):
-        """普通导出：导出当前选中的节点（含其全部子孙节点）为 Markdown"""
-        item = self._tree.currentItem()
-        if not item:
-            mb_info(self, "提示", "请先在左侧大纲树中选择要导出的节点")
-            return
-        # 先保存当前编辑内容，避免遗漏未保存的修改
-        self._save_node()
-        nid = item.data(0, Qt.ItemDataRole.UserRole)
-        node = self._project_service.get_node(nid)
-        if not node:
-            mb_error(self, "导出失败", "未找到该节点")
-            return
-        # 只导出当前选中节点自身内容，不做深度递归
-        lines = [f"{'#' * node.level.value} {node.title}"]
-        body = (node.content or "").strip()
-        if body:
-            lines.append("")
-            lines.append(body)
-        content = "\n".join(lines).rstrip() + "\n"
-
-        proj = self._project_service.get_current_project() or "project"
-        default_name = f"{proj}_{node.title}.md"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出 Markdown", default_name, "Markdown 文件 (*.md)")
-        if not path:
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-            mb_info(self, "导出成功", f"已导出 {len(lines)} 行到：\n{path}")
-        except Exception as e:
-            mb_error(self, "导出失败", str(e))
-
-    def _export_l1_l3(self):
-        """一键导出：仅导出全部 L1~L3 层级节点为 Markdown"""
-        # 先保存当前编辑内容，确保导出的内容是最新的
-        self._save_node()
-        all_nodes = self._project_service.get_outline_tree()
-        if not all_nodes:
-            mb_info(self, "提示", "当前项目没有大纲节点可导出")
-            return
-        by_id = {n.node_id: n for n in all_nodes}
-        # 找到所有顶层 L1 节点
-        roots = [n for n in all_nodes if n.parent_id is None]
-        roots.sort(key=lambda n: n.order)
-        lines = []
-        for root in roots:
-            self._render_markdown_limited(root, by_id, lines, max_level=3)
-        content = "\n".join(lines).rstrip() + "\n"
-
-        proj = self._project_service.get_current_project() or "project"
-        default_name = f"{proj}_L1-L3.md"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "一键导出 L1~L3", default_name, "Markdown 文件 (*.md)")
-        if not path:
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-            mb_info(self, "导出成功", f"已导出 L1~L3 到：\n{path}")
-        except Exception as e:
-            mb_error(self, "导出失败", str(e))
-
-    def _render_markdown_limited(self, node, by_id, lines, max_level=3):
-        """深度递归渲染节点，但层级超过 max_level 的节点不再展开"""
-        if node.level.value > max_level:
-            return
-        lines.append(f"{'#' * node.level.value} {node.title}")
-        content = (node.content or "").strip()
-        if content:
-            lines.append("")
-            lines.append(content)
-            lines.append("")
-        for cid in node.children_ids:
-            child = by_id.get(cid)
-            if child:
-                self._render_markdown_limited(child, by_id, lines, max_level)
+    # ── ★ v3.2: 导出功能已统合到「📤 导出」导航页 ──
 
     # ── ★ v3补齐: 右键状态切换 ──
 

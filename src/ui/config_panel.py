@@ -307,12 +307,19 @@ class ConfigPanel(BasePanel):
             enable_deep_thinking=self._s_reasoning.isChecked(),
             enable_deep_continue=self._s_deep_continue.isChecked(),
         )
-        if self._current_source_name and self._current_source_name != name:
-            self._config_manager.remove_ai_source(self._current_source_name)
-        self._config_manager.add_ai_source(source)
+        old_name = self._current_source_name
+        if old_name and old_name != name:
+            # ★ 重命名：更新配置条目，并把旧名称下的 API Key 迁移到新名称
+            self._config_manager.update_ai_source(old_name, source)
+            self._config_manager.migrate_api_key(old_name, name)
+        else:
+            self._config_manager.add_ai_source(source)
         api_key = self._s_key.text().strip()
         if api_key:
             self._config_manager.set_api_key(name, api_key)
+        else:
+            # 未重新输入 Key 时沿用已存储的密钥
+            api_key = self._config_manager.get_api_key(name) or ""
         self._current_source_name = name
         self._refresh_source_list()
         current = self._config_manager.get_current_ai_source()

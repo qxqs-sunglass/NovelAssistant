@@ -25,7 +25,7 @@ import sqlite3
 import base64
 import hashlib
 import threading
-import subprocess
+import uuid
 from pathlib import Path
 from typing import Optional, Any
 from dataclasses import dataclass, field
@@ -316,6 +316,23 @@ class ConfigManager:
         self.save_app_config(config)
         self._event_bus.publish("config:changed", {"action": "update", "name": source.name}, "ConfigManager")
 
+    def migrate_api_key(self, old_name: str, new_name: str) -> bool:
+        """把旧名称下的 API 密钥迁移到新名称（用于 AI 源重命名）。
+
+        Returns:
+            True 表示成功迁移；False 表示旧密钥不存在或名称为空。
+        """
+        if not old_name or not new_name or old_name == new_name:
+            return False
+        old_key = self.get_api_key(old_name)
+        if not old_key:
+            return False
+        self.set_api_key(new_name, old_key)
+        self.delete_api_key(old_name)
+        self._logger.log(f"密钥已迁移: {old_name} → {new_name}",
+                         "ConfigManager", "INFO")
+        return True
+
     def remove_ai_source(self, name: str) -> None:
         """删除 AI 源"""
         config = self.load_app_config()
@@ -480,7 +497,18 @@ class ConfigManager:
         return conn
 
     def _derive_encryption_key(self) -> bytes:
-        """派生 AES-256 加密密钥（结果缓存，进程内只派生一次）"""
+        """派生 AES-256 加密密钥（结果缓存，进程内只派生一次）
+
+        ★ v3.2 修复「AI Key 容易丢失」:
+          旧实现使用 wmic 读取 CPU/主板序列号作为密钥来源，存在两个致命问题：
+            1. wmic 在新版 Windows 上被弃用/移除，失败后降级为「主机名+用户名」；
+            2. 主机名或用户名一旦变化（换网络、改用户名、域环境切换），派生出
+               的密钥就变了，原 AES-GCM 密文将永久无法解密 → Key「丢失」。
+          现改为使用「本机稳定标识文件」(.machine_uid)：
+            - 首次运行随机生成一次并持久化到配置目录，此后固定不变；
+            - 只依赖该文件本身，不受硬件/用户名/网络变化影响；
+            - 文件意外丢失时降级为 MAC 地址，再降级为固定常量，保证永远可派生。
+        """
         if self._encryption_key is not None:
             return self._encryption_key
 
@@ -489,7 +517,7 @@ class ConfigManager:
             if self._encryption_key is not None:
                 return self._encryption_key
             machine_id = self._get_machine_id()
-            # 使用机器标识作为 PBKDF2 的输入
+            # 使用稳定机器标识作为 PBKDF2 的输入
             kdf = PBKDF2HMAC(
                 algorithm=hashes.SHA256(),
                 length=32,  # AES-256
@@ -500,60 +528,56 @@ class ConfigManager:
             self._encryption_key = kdf.derive(machine_id.encode("utf-8"))
             return self._encryption_key
 
-    # 机器标识缓存（进程内只计算一次；wmic 在部分 Windows 上可能很慢或挂起）
+    # 机器标识缓存（进程内只计算一次）
     _MACHINE_ID_CACHE: Optional[str] = None
     _MACHINE_ID_LOCK = threading.Lock()
+    # 本机稳定标识文件名（存放于配置目录）
+    MACHINE_UID_FILE = ".machine_uid"
 
-    @classmethod
-    def _get_machine_id(cls) -> str:
-        """获取机器标识（缓存结果，避免每次解密都触发慢速 wmic 子进程）
+    def _get_machine_id(self) -> str:
+        """获取本机稳定标识（缓存结果，进程内只计算一次）
 
-        ★ v3性能优化:
-          - wmic 已被微软弃用，在较新的 Windows 上可能不存在或挂起，原实现
-            每次派生密钥都会执行 2 个子进程（各最多 5s），导致打开配置界面时
-            明显卡顿。改为结果缓存 + 更短的超时 + 首选环境变量。
-          - 由于加密密钥在本进程内仅派生一次并缓存，此处也只需计算一次。
+        ★ v3.2 重写: 不再依赖 wmic / 主机名 / 用户名，改用持久化的稳定标识文件，
+        从根本上避免因环境变化导致密钥漂移、API Key 无法解密的问题。
 
         Returns:
-            机器标识字符串，获取失败返回 "novel_assistant_default"
+            机器标识字符串（始终可获取，最差为固定常量）
         """
-        if cls._MACHINE_ID_CACHE is not None:
-            return cls._MACHINE_ID_CACHE
+        if ConfigManager._MACHINE_ID_CACHE is not None:
+            return ConfigManager._MACHINE_ID_CACHE
 
-        with cls._MACHINE_ID_LOCK:
-            if cls._MACHINE_ID_CACHE is not None:
-                return cls._MACHINE_ID_CACHE
-            cls._MACHINE_ID_CACHE = cls._compute_machine_id()
-            return cls._MACHINE_ID_CACHE
+        with ConfigManager._MACHINE_ID_LOCK:
+            if ConfigManager._MACHINE_ID_CACHE is not None:
+                return ConfigManager._MACHINE_ID_CACHE
+            ConfigManager._MACHINE_ID_CACHE = self._compute_machine_id()
+            return ConfigManager._MACHINE_ID_CACHE
 
-    @staticmethod
-    def _compute_machine_id() -> str:
-        """实际计算机器标识（只在第一次调用时执行）"""
-        # 首选：wmic CPU + 主板序列号（缩短超时，避免长时间阻塞）
+    def _compute_machine_id(self) -> str:
+        """计算本机稳定标识（首次运行生成并落盘，之后固定不变）"""
+        # 首选：读取/生成本机稳定标识文件
         try:
-            cpu_result = subprocess.run(
-                ["wmic", "cpu", "get", "ProcessorId"],
-                capture_output=True, text=True, timeout=2,
-            )
-            cpu_id = cpu_result.stdout.strip().split("\n")[-1].strip()
-
-            board_result = subprocess.run(
-                ["wmic", "baseboard", "get", "SerialNumber"],
-                capture_output=True, text=True, timeout=2,
-            )
-            board_sn = board_result.stdout.strip().split("\n")[-1].strip()
-
-            combined = f"{cpu_id}_{board_sn}".strip("_")
-            if combined:
-                return hashlib.sha256(combined.encode()).hexdigest()
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            uid_path = self._config_dir / self.MACHINE_UID_FILE
+            if uid_path.exists():
+                content = uid_path.read_text(encoding="utf-8").strip()
+                if content:
+                    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+            # 不存在或为空 → 生成新的稳定标识
+            new_uid = uuid.uuid4().hex + uuid.uuid4().hex
+            try:
+                uid_path.write_text(new_uid, encoding="utf-8")
+            except OSError:
+                pass
+            return hashlib.sha256(new_uid.encode("utf-8")).hexdigest()
+        except Exception:
             pass
 
-        # 降级：使用主机名 + 用户名
+        # 降级：MAC 地址（uuid.getnode 在同机通常稳定；getnode 失败会随机，故再兜底）
         try:
-            hostname = os.environ.get("COMPUTERNAME", "unknown")
-            username = os.environ.get("USERNAME", "unknown")
-            fallback = f"{hostname}_{username}"
-            return hashlib.sha256(fallback.encode()).hexdigest()
+            mac = uuid.getnode()
+            if mac:
+                return hashlib.sha256(f"mac_{mac}".encode("utf-8")).hexdigest()
         except Exception:
-            return "novel_assistant_default_v2"
+            pass
+
+        # 最终兜底：固定常量，保证永远能派生出一个密钥
+        return hashlib.sha256(b"novel_assistant_stable_fallback_v3_2").hexdigest()

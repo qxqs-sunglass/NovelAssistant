@@ -26,16 +26,19 @@ from typing import Optional, TextIO, Dict, Any
 class Logger(threading.Thread):
     """线程化日志系统，通过消息队列异步写入"""
 
-    def __init__(self, log_dir: str = "logs", min_level: str = "INFO"):
+    def __init__(self, log_dir: str = "logs", min_level: str = "INFO",
+                 event_bus=None):
         """
         Args:
             log_dir: 日志根目录
             min_level: 最低记录级别
+            event_bus: 可选事件总线，用于向 UI 实时推送 "log:new" 事件
         """
         super().__init__()
         self.ID = "Logger"
         self.log_dir = log_dir
         self.start_time = time.time()
+        self._event_bus = event_bus
 
         # 日志级别
         self.LEVELS: Dict[str, int] = {
@@ -191,6 +194,17 @@ class Logger(threading.Thread):
             if level in ("ERROR", "CRITICAL"):
                 print(f"[{self.ID}] {line}")
 
+            # ★ 实时推送日志到 UI（日志面板订阅 "log:new"）
+            if self._event_bus is not None:
+                try:
+                    self._event_bus.publish(
+                        "log:new",
+                        {"text": line, "level": level, "module_id": module_id},
+                        self.ID,
+                    )
+                except Exception:
+                    pass
+
         except Exception as e:
             print(f"[{self.ID}] 写入日志失败: {e}")
 
@@ -276,12 +290,14 @@ _logger_instance: Optional[Logger] = None
 _logger_lock = threading.Lock()
 
 
-def get_logger(log_dir: str = "logs", min_level: str = "INFO") -> Logger:
+def get_logger(log_dir: str = "logs", min_level: str = "INFO",
+               event_bus=None) -> Logger:
     """获取全局 Logger 单例（线程安全懒加载）
 
     Args:
         log_dir: 日志根目录（仅首次调用时生效）
         min_level: 最低日志级别（仅首次调用时生效）
+        event_bus: 可选事件总线，用于实时推送 "log:new"（仅首次调用时生效）
 
     Returns:
         Logger 实例（已启动线程）
@@ -290,6 +306,7 @@ def get_logger(log_dir: str = "logs", min_level: str = "INFO") -> Logger:
     if _logger_instance is None:
         with _logger_lock:
             if _logger_instance is None:
-                _logger_instance = Logger(log_dir=log_dir, min_level=min_level)
+                _logger_instance = Logger(log_dir=log_dir, min_level=min_level,
+                                          event_bus=event_bus)
                 _logger_instance.start()
     return _logger_instance

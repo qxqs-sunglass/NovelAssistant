@@ -988,11 +988,16 @@ class ChatPanel(BasePanel):
                 last_user = m["content"]
                 break
         if last_user:
+            # ★ 回填到输入框，由用户确认后手动发送。
+            # 不直接调用 _on_send()，否则会向会话重复写入一条相同的 user 消息。
             self._input_text.setPlainText(last_user)
-            self._on_send()
+            self._input_text.moveCursor(self._input_text.textCursor().End)
+            self._add_system_bubble("↩️ 已回填上一条消息，确认无误后点击「发送」")
 
     def _stop_streaming(self):
         """停止当前 AI 流式输出"""
+        if not self._is_streaming:
+            return
         try:
             if hasattr(self._ai_client, "cancel"):
                 self._ai_client.cancel()
@@ -1028,6 +1033,20 @@ class ChatPanel(BasePanel):
             if m.get("role") == "assistant":
                 m["content"] = full
                 break
+        # ★ 用户主动停止：不显示截断提示
+        if data.get("cancelled"):
+            if self._current_session_id and full:
+                meta = {}
+                reasoning = data.get("reasoning") or self._current_reasoning
+                if reasoning:
+                    meta["reasoning"] = reasoning
+                self._session_manager.add_message(
+                    self._current_session_id, "assistant", full,
+                    meta=meta if meta else None,
+                )
+            self._is_streaming = False
+            self.stream_finished.emit()
+            return
         # ★ 检测到输出被截断（达到 max_tokens 上限），明确告知用户并提供解决办法
         if data.get("truncated"):
             max_tok = data.get("max_tokens", "?")
@@ -1067,6 +1086,29 @@ class ChatPanel(BasePanel):
         self.tool_result_sig.emit(event.data)
 
     def _do_response_error(self, data: dict):
+        # ★ 保留出错前已生成的部分内容，避免用户已看到的内容凭空消失
+        if self._response_buffer:
+            if self._streaming_bubble:
+                self._streaming_bubble.set_content(self._response_buffer)
+            for m in reversed(self._msg_data):
+                if m.get("role") == "assistant":
+                    m["content"] = self._response_buffer
+                    break
+            if self._current_session_id:
+                meta = {}
+                if self._current_reasoning:
+                    meta["reasoning"] = self._current_reasoning
+                self._session_manager.add_message(
+                    self._current_session_id, "assistant",
+                    self._response_buffer, meta=meta if meta else None,
+                )
+        # ★ 复位流式状态与按钮（防止按钮卡在「停止」）
+        self._is_streaming = False
+        self._streaming_bubble = None
+        self._response_buffer = ""
+        self._send_btn.setText("发送")
+        self._send_btn.setStyleSheet(
+            "background:#0078d4; color:white; padding:8px 16px; font-weight:bold;")
         self._add_system_bubble(f"❌ 错误: {data.get('error', '未知')}")
 
     def _on_continue_evt(self, event):

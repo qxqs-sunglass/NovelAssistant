@@ -1,22 +1,25 @@
-"""日志面板 — 查看 + 过滤 + 导出（v3.0）"""
+"""日志面板 — 查看 + 过滤（v3.2，导出已移至「📤 导出」页）"""
 import os
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit,
-    QPushButton, QComboBox, QFileDialog,
+    QPushButton, QComboBox,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 from src.ui.base_panel import BasePanel
-from src.ui.common import mb_info
 
 
 class LogPanel(BasePanel):
     """日志查看面板"""
 
+    # ★ 跨线程桥接：日志由 Logger 后台线程发布，通过信号切回主线程更新 UI
+    log_received = Signal(str)
+
     def __init__(self, event_bus, logger, config_manager=None):
         self._config_manager = config_manager
         self._all_lines: list[str] = []
         super().__init__(event_bus, logger)
+        self.log_received.connect(self._do_append_log)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -30,9 +33,7 @@ class LogPanel(BasePanel):
         self._filter.currentTextChanged.connect(self._apply_filter)
         tb.addWidget(self._filter)
         tb.addStretch()
-        export_btn = QPushButton("导出")
-        export_btn.clicked.connect(self._export_logs)
-        tb.addWidget(export_btn)
+        # ★ v3.2: 导出功能已统合到「📤 导出」导航页
         layout.addLayout(tb)
 
         # Log display
@@ -68,8 +69,15 @@ class LogPanel(BasePanel):
         self._apply_filter()
 
     def _on_new_log(self, event):
+        # ★ 仅转发信号（Logger 线程），UI 操作在 _do_append_log（主线程）
         line = event.data.get("text", "")
+        if line:
+            self.log_received.emit(line)
+
+    def _do_append_log(self, line: str):
         self._all_lines.append(line)
+        if len(self._all_lines) > 5000:
+            self._all_lines = self._all_lines[-5000:]
         if self._filter.currentText() == "ALL" or f"[{self._filter.currentText()}]" in line:
             self._text.append(line)
             self._text.moveCursor(self._text.textCursor().End)
@@ -81,10 +89,4 @@ class LogPanel(BasePanel):
             if level == "ALL" or f"[{level}]" in line:
                 self._text.append(line)
 
-    def _export_logs(self):
-        path, _ = QFileDialog.getSaveFileName(self, "导出日志", "", "Text (*.txt)")
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(self._all_lines))
-        mb_info(self, "导出完成", f"已导出到 {path}")
+    # ★ v3.2: 日志导出功能已统合到「📤 导出」导航页
