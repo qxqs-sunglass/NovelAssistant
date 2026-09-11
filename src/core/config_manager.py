@@ -89,7 +89,7 @@ class AISourceConfig:
 @dataclass
 class AppConfig:
     """应用全局配置"""
-    version: str = "3.1.0"
+    version: str = "3.2.0"
     language: str = "zh-CN"
     window_width: int = 1200
     window_height: int = 700
@@ -176,7 +176,7 @@ class AppConfig:
     def from_dict(cls, d: dict) -> "AppConfig":
         sources = [AISourceConfig.from_dict(s) for s in d.get("ai_sources", [])]
         return cls(
-            version=d.get("version", "0.2.0"),
+            version=d.get("version", "3.2.0"),
             language=d.get("language", "zh-CN"),
             window_width=d.get("window_width", 1200),
             window_height=d.get("window_height", 700),

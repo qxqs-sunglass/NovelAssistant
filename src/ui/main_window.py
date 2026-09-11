@@ -63,7 +63,7 @@ class MainWindow(QMainWindow):
         self._session_manager = session_manager
         self._project_service = project_service
 
-        self.setWindowTitle("小说创作助手 v3.0")
+        self.setWindowTitle("小说创作助手 v3.2")
         self.setMinimumSize(self.MIN_WIDTH, self.MIN_HEIGHT)
 
         # Window size from config

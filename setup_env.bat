@@ -17,17 +17,18 @@ if errorlevel 1 (
 echo [INFO] Python 版本:
 python --version
 
-:: 创建虚拟环境
-if exist venv (
+:: 创建虚拟环境（统一使用 .venv，与 run_app.bat 保持一致）
+if exist .venv (
     echo [INFO] 虚拟环境已存在，跳过创建
 ) else (
     echo [INFO] 创建虚拟环境...
-    python -m venv venv
+    python -m venv .venv
 )
 
 :: 激活并安装依赖
 echo [INFO] 安装依赖...
-call venv\Scripts\activate.bat
+call .venv\Scripts\activate.bat
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 
 echo.
